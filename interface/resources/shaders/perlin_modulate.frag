@@ -21,7 +21,7 @@ const float frequency = 256.0;
 //const float frequency = 65536.0; // looks better with current TREE_SCALE, was 1024 when TREE_SCALE was either 512 or 128
 
 // the noise amplitude
-const float amplitude = 0.5;
+const float amplitude = 0.3;
 
 // the position in model space
 varying vec3 position;
@@ -96,13 +96,13 @@ float turbulence(vec3 position, float power){
 
 float turb(vec3 position){
     return turbulence(position, 1)
-    + turbulence(position, 2), 
+    + turbulence(position, 2) 
     + turbulence(position, 4) 
-    + turbulence(position, 8) 
-    + turbulence(position, 16) 
-    + turbulence(position, 32)
-    + turbulence(position, 64)
-    + turbulence(position, 128)
+//    + turbulence(position, 8) 
+//    + turbulence(position, 16) 
+//    + turbulence(position, 32)
+//    + turbulence(position, 64)
+//    + turbulence(position, 128)
     ;
 }
 
@@ -110,10 +110,18 @@ float turb(vec3 position){
 void main(void) {
 
     // get noise in range 0 .. 1
-    float noise = clamp(0.5f + amplitude * turb(position * frequency), 0, 1); 
+    //float noise = clamp(0.5f + amplitude * turb(position * frequency), 0, 1); 
+
+    // get noise in range -amplotude .. +amplitude
+    float noise = amplitude * clamp(turb(position * frequency), -1, 1);
 
     // apply vertex lighting
-    vec3 color = gl_Color.rgb * vec3(noise, noise, noise);
+
+    // original -- modulate base color by noise, noise should be in 0..1 range
+    //vec3 color = gl_Color.rgb * vec3(noise, noise, noise);
+
+    // two-way blend. noise < 0 blends to black, noise > 0 blends to white, with base color as noise approaches 0.
+    vec3 color = noise < 0? mix(vec3(0,0,0), gl_Color.rgb, 1 + noise) : mix(gl_Color.rgb, vec3(1,1,1), noise);
     gl_FragColor = vec4(color, 1);
 }
 
