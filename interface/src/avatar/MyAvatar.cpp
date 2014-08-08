@@ -32,6 +32,7 @@
 #include "Audio.h"
 #include "Environment.h"
 #include "Menu.h"
+#include "ModelReferential.h"
 #include "MyAvatar.h"
 #include "Physics.h"
 #include "devices/Faceshift.h"
@@ -84,13 +85,13 @@ MyAvatar::MyAvatar() :
     }
     _skeletonModel.setEnableShapes(true);
     // The skeleton is both a PhysicsEntity and Ragdoll, so we add it to the simulation once for each type.
-    _physicsSimulation.addEntity(&_skeletonModel);
-    _physicsSimulation.addRagdoll(&_skeletonModel);
+    _physicsSimulation.setEntity(&_skeletonModel);
+    _physicsSimulation.setRagdoll(&_skeletonModel);
 }
 
 MyAvatar::~MyAvatar() {
-    _physicsSimulation.removeEntity(&_skeletonModel);
-    _physicsSimulation.removeRagdoll(&_skeletonModel);
+    _physicsSimulation.setRagdoll(NULL);
+    _physicsSimulation.setEntity(NULL);
     _lookAtTargetAvatar.clear();
 }
 
@@ -108,15 +109,14 @@ void MyAvatar::reset() {
 }
 
 void MyAvatar::update(float deltaTime) {
-    PerformanceTimer perfTimer("MyAvatar::update/");
+    if (_referential) {
+        _referential->update();
+    }
+    
     Head* head = getHead();
     head->relaxLean(deltaTime);
-    {
-        PerformanceTimer perfTimer("MyAvatar::update/updateFromTrackers");
-        updateFromTrackers(deltaTime);
-    }
+    updateFromTrackers(deltaTime);
     if (Menu::getInstance()->isOptionChecked(MenuOption::MoveWithLean)) {
-        PerformanceTimer perfTimer("MyAvatar::update/moveWithLean");
         // Faceshift drive is enabled, set the avatar drive based on the head position
         moveWithLean();
     }
@@ -127,64 +127,61 @@ void MyAvatar::update(float deltaTime) {
     head->setAudioAverageLoudness(audio->getAudioAverageInputLoudness());
 
     if (_motionBehaviors & AVATAR_MOTION_OBEY_ENVIRONMENTAL_GRAVITY) {
-        PerformanceTimer perfTimer("MyAvatar::update/gravityWork");
         setGravity(Application::getInstance()->getEnvironment()->getGravity(getPosition()));
     }
 
-    {
-        PerformanceTimer perfTimer("MyAvatar::update/simulate");
-        simulate(deltaTime);
-    }
+    simulate(deltaTime);
 }
 
 void MyAvatar::simulate(float deltaTime) {
-    PerformanceTimer perfTimer("MyAvatar::simulate");
-
+    PerformanceTimer perfTimer("simulate");
     if (_scale != _targetScale) {
         float scale = (1.0f - SMOOTHING_RATIO) * _scale + SMOOTHING_RATIO * _targetScale;
         setScale(scale);
         Application::getInstance()->getCamera()->setScale(scale);
     }
-
-    // no extra movement of the hand here any more ...
-    _handState = HAND_STATE_NULL;
+    _skeletonModel.setShowTrueJointTransforms(! Menu::getInstance()->isOptionChecked(MenuOption::CollideAsRagdoll));
 
     {
-        PerformanceTimer perfTimer("MyAvatar::simulate/updateOrientation");
+        PerformanceTimer perfTimer("transform");
         updateOrientation(deltaTime);
-    }
-    {
-        PerformanceTimer perfTimer("MyAvatar::simulate/updatePosition");
         updatePosition(deltaTime);
     }
 
     {
-        PerformanceTimer perfTimer("MyAvatar::simulate/hand Collision,simulate");
+        PerformanceTimer perfTimer("hand");
         // update avatar skeleton and simulate hand and head
         getHand()->simulate(deltaTime, true);
     }
 
     {
-        PerformanceTimer perfTimer("MyAvatar::simulate/_skeletonModel.simulate()");
+        PerformanceTimer perfTimer("skeleton");
         _skeletonModel.simulate(deltaTime);
     }
     {
-        PerformanceTimer perfTimer("MyAvatar::simulate/simulateAttachments");
+        PerformanceTimer perfTimer("attachments");
         simulateAttachments(deltaTime);
     }
 
     {
-        PerformanceTimer perfTimer("MyAvatar::simulate/copy joints");
+        PerformanceTimer perfTimer("joints");
         // copy out the skeleton joints from the model
         _jointData.resize(_skeletonModel.getJointStateCount());
-        for (int i = 0; i < _jointData.size(); i++) {
-            JointData& data = _jointData[i];
-            data.valid = _skeletonModel.getJointState(i, data.rotation);
+        if (Menu::getInstance()->isOptionChecked(MenuOption::CollideAsRagdoll)) {
+            for (int i = 0; i < _jointData.size(); i++) {
+                JointData& data = _jointData[i];
+                data.valid = _skeletonModel.getVisibleJointState(i, data.rotation);
+            }
+        } else {
+            for (int i = 0; i < _jointData.size(); i++) {
+                JointData& data = _jointData[i];
+                data.valid = _skeletonModel.getJointState(i, data.rotation);
+            }
         }
     }
 
     {
-        PerformanceTimer perfTimer("MyAvatar::simulate/head Simulate");
+        PerformanceTimer perfTimer("head");
         Head* head = getHead();
         glm::vec3 headPosition;
         if (!_skeletonModel.getHeadPosition(headPosition)) {
@@ -196,18 +193,23 @@ void MyAvatar::simulate(float deltaTime) {
     }
     
     {
-        PerformanceTimer perfTimer("MyAvatar::simulate/hair Simulate");
+        PerformanceTimer perfTimer("hair");
         if (Menu::getInstance()->isOptionChecked(MenuOption::StringHair)) {
-            simulateHair(deltaTime);
+            _hair.setAcceleration(getAcceleration() * getHead()->getFinalOrientationInWorldFrame());
+            _hair.setAngularVelocity((getAngularVelocity() + getHead()->getAngularVelocity()) * getHead()->getFinalOrientationInWorldFrame());
+            _hair.setAngularAcceleration(getAngularAcceleration() * getHead()->getFinalOrientationInWorldFrame());
+            _hair.setGravity(Application::getInstance()->getEnvironment()->getGravity(getPosition()) * getHead()->getFinalOrientationInWorldFrame());
+            _hair.simulate(deltaTime);
         }
     }
 
     {
-        PerformanceTimer perfTimer("MyAvatar::simulate/ragdoll");
+        PerformanceTimer perfTimer("ragdoll");
         if (Menu::getInstance()->isOptionChecked(MenuOption::CollideAsRagdoll)) {
-            const int minError = 0.01f;
+            const float minError = 0.01f;
             const float maxIterations = 10;
             const quint64 maxUsec = 2000;
+            _physicsSimulation.setTranslation(_position);
             _physicsSimulation.stepForward(deltaTime, minError, maxIterations, maxUsec);
         } else {
             _skeletonModel.moveShapesTowardJoints(1.0f);
@@ -216,7 +218,7 @@ void MyAvatar::simulate(float deltaTime) {
 
     // now that we're done stepping the avatar forward in time, compute new collisions
     if (_collisionGroups != 0) {
-        PerformanceTimer perfTimer("MyAvatar::simulate/_collisionGroups");
+        PerformanceTimer perfTimer("collisions");
         Camera* myCamera = Application::getInstance()->getCamera();
 
         float radius = getSkeletonHeight() * COLLISION_RADIUS_SCALE;
@@ -225,21 +227,19 @@ void MyAvatar::simulate(float deltaTime) {
             radius *= COLLISION_RADIUS_SCALAR;
         }
         if (_collisionGroups & COLLISION_GROUP_ENVIRONMENT) {
-            PerformanceTimer perfTimer("MyAvatar::simulate/updateCollisionWithEnvironment");
+            PerformanceTimer perfTimer("environment");
             updateCollisionWithEnvironment(deltaTime, radius);
         }
         if (_collisionGroups & COLLISION_GROUP_VOXELS) {
-            PerformanceTimer perfTimer("MyAvatar::simulate/updateCollisionWithVoxels");
+            PerformanceTimer perfTimer("voxels");
             updateCollisionWithVoxels(deltaTime, radius);
         } else {
             _trapDuration = 0.0f;
         }
-    /* TODO: Andrew to make this work
         if (_collisionGroups & COLLISION_GROUP_AVATARS) {
-            PerformanceTimer perfTimer("MyAvatar::simulate/updateCollisionWithAvatars");
+            PerformanceTimer perfTimer("avatars");
             updateCollisionWithAvatars(deltaTime);
         }
-    */
     }
 
     // consider updating our billboard
@@ -438,6 +438,7 @@ glm::vec3 MyAvatar::getLeftPalmPosition() {
     leftHandPosition += HAND_TO_PALM_OFFSET * glm::inverse(leftRotation);
     return leftHandPosition;
 }
+
 glm::vec3 MyAvatar::getRightPalmPosition() {
     glm::vec3 rightHandPosition;
     getSkeletonModel().getRightHandPosition(rightHandPosition);
@@ -445,6 +446,32 @@ glm::vec3 MyAvatar::getRightPalmPosition() {
     getSkeletonModel().getJointRotationInWorldFrame(getSkeletonModel().getRightHandJointIndex(), rightRotation);
     rightHandPosition += HAND_TO_PALM_OFFSET * glm::inverse(rightRotation);
     return rightHandPosition;
+}
+
+void MyAvatar::clearReferential() {
+    changeReferential(NULL);
+}
+
+bool MyAvatar::setModelReferential(int id) {
+    ModelTree* tree = Application::getInstance()->getModels()->getTree();
+    changeReferential(new ModelReferential(id, tree, this));
+    if (_referential->isValid()) {
+        return true;
+    } else {
+        changeReferential(NULL);
+        return false;
+    }
+}
+
+bool MyAvatar::setJointReferential(int id, int jointIndex) {
+    ModelTree* tree = Application::getInstance()->getModels()->getTree();
+    changeReferential(new JointReferential(jointIndex, id, tree, this));
+    if (!_referential->isValid()) {
+        return true;
+    } else {
+        changeReferential(NULL);
+        return false;
+    }
 }
 
 void MyAvatar::setLocalGravity(glm::vec3 gravity) {
@@ -549,6 +576,40 @@ void MyAvatar::stopAnimation(const QString& url) {
             handle->stop();
         }
     }
+}
+
+AnimationDetails MyAvatar::getAnimationDetailsByRole(const QString& role) {
+    AnimationDetails result;
+    if (QThread::currentThread() != thread()) {
+        QMetaObject::invokeMethod(this, "getAnimationDetailsByRole", Qt::BlockingQueuedConnection,
+            Q_RETURN_ARG(AnimationDetails, result), 
+            Q_ARG(const QString&, role));
+        return result;
+    }
+    foreach (const AnimationHandlePointer& handle, _skeletonModel.getRunningAnimations()) {
+        if (handle->getRole() == role) {
+            result = handle->getAnimationDetails();
+            break;
+        }
+    }
+    return result;
+}
+
+AnimationDetails MyAvatar::getAnimationDetails(const QString& url) {
+    AnimationDetails result;
+    if (QThread::currentThread() != thread()) {
+        QMetaObject::invokeMethod(this, "getAnimationDetails", Qt::BlockingQueuedConnection,
+            Q_RETURN_ARG(AnimationDetails, result), 
+            Q_ARG(const QString&, url));
+        return result;
+    }
+    foreach (const AnimationHandlePointer& handle, _skeletonModel.getRunningAnimations()) {
+        if (handle->getURL() == url) {
+            result = handle->getAnimationDetails();
+            break;
+        }
+    }
+    return result;
 }
 
 void MyAvatar::saveData(QSettings* settings) {
@@ -860,8 +921,17 @@ void MyAvatar::renderBody(RenderMode renderMode, float glowLevel) {
     const glm::vec3 cameraPos = camera->getPosition() + (camera->getRotation() * glm::vec3(0.0f, 0.0f, 1.0f)) * camera->getDistance();
     if (shouldRenderHead(cameraPos, renderMode)) {
         getHead()->render(1.0f, modelRenderMode);
+        
         if (Menu::getInstance()->isOptionChecked(MenuOption::StringHair)) {
-            renderHair();
+            // Render Hair
+            glPushMatrix();
+            glm::vec3 headPosition = getHead()->getPosition();
+            glTranslatef(headPosition.x, headPosition.y, headPosition.z);
+            const glm::quat& rotation = getHead()->getFinalOrientationInWorldFrame();
+            glm::vec3 axis = glm::axis(rotation);
+            glRotatef(glm::degrees(glm::angle(rotation)), axis.x, axis.y, axis.z);
+            _hair.render();
+            glPopMatrix();
         }
     }
     getHand()->render(true, modelRenderMode);
@@ -872,11 +942,10 @@ const float RENDER_HEAD_CUTOFF_DISTANCE = 0.50f;
 bool MyAvatar::shouldRenderHead(const glm::vec3& cameraPosition, RenderMode renderMode) const {
     const Head* head = getHead();
     return (renderMode != NORMAL_RENDER_MODE) || 
-        (glm::length(cameraPosition - head->calculateAverageEyePosition()) > RENDER_HEAD_CUTOFF_DISTANCE * _scale);
+        (glm::length(cameraPosition - head->getEyePosition()) > RENDER_HEAD_CUTOFF_DISTANCE * _scale);
 }
 
 float MyAvatar::computeDistanceToFloor(const glm::vec3& startPoint) {
-    PerformanceTimer perfTimer("MyAvatar::computeDistanceToFloor()");
     glm::vec3 direction = -_worldUpDirection;
     OctreeElement* elementHit; // output from findRayIntersection
     float distance = FLT_MAX; // output from findRayIntersection
@@ -942,7 +1011,6 @@ void MyAvatar::updateOrientation(float deltaTime) {
 const float NEARBY_FLOOR_THRESHOLD = 5.0f;
 
 void MyAvatar::updatePosition(float deltaTime) {
-    PerformanceTimer perfTimer("MyAvatar::updatePosition");
     float keyboardInput = fabsf(_driveKeys[FWD] - _driveKeys[BACK]) + 
         fabsf(_driveKeys[RIGHT] - _driveKeys[LEFT]) + 
         fabsf(_driveKeys[UP] - _driveKeys[DOWN]);
@@ -1482,8 +1550,6 @@ bool findAvatarAvatarPenetration(const glm::vec3 positionA, float radiusA, float
     return false;
 }
 
-const float BODY_COLLISION_RESOLUTION_TIMESCALE = 0.5f; // seconds
-
 void MyAvatar::updateCollisionWithAvatars(float deltaTime) {
     //  Reset detector for nearest avatar
     _distanceToNearestAvatar = std::numeric_limits<float>::max();
@@ -1494,41 +1560,51 @@ void MyAvatar::updateCollisionWithAvatars(float deltaTime) {
     }
     float myBoundingRadius = getBoundingRadius();
 
-    const float BODY_COLLISION_RESOLUTION_FACTOR = glm::max(1.0f, deltaTime / BODY_COLLISION_RESOLUTION_TIMESCALE);
-
+    // find nearest avatar
+    float nearestDistance2 = std::numeric_limits<float>::max();
+    Avatar* nearestAvatar = NULL;
     foreach (const AvatarSharedPointer& avatarPointer, avatars) {
         Avatar* avatar = static_cast<Avatar*>(avatarPointer.data());
         if (static_cast<Avatar*>(this) == avatar) {
             // don't collide with ourselves
             continue;
         }
-        float distance = glm::length(_position - avatar->getPosition());        
-        if (_distanceToNearestAvatar > distance) {
-            _distanceToNearestAvatar = distance;
+        float distance2 = glm::distance2(_position, avatar->getPosition());        
+        if (nearestDistance2 > distance2) {
+            nearestDistance2 = distance2;
+            nearestAvatar = avatar;
         }
-        float theirBoundingRadius = avatar->getBoundingRadius();
-        if (distance < myBoundingRadius + theirBoundingRadius) {
-            // collide our body against theirs
-            QVector<const Shape*> myShapes;
-            _skeletonModel.getBodyShapes(myShapes);
-            QVector<const Shape*> theirShapes;
-            avatar->getSkeletonModel().getBodyShapes(theirShapes);
+    }
+    _distanceToNearestAvatar = glm::sqrt(nearestDistance2);
 
-            CollisionInfo collision;
-            if (ShapeCollider::collideShapesCoarse(myShapes, theirShapes, collision)) {
-                float penetrationDepth = glm::length(collision._penetration);
-                if (penetrationDepth > myBoundingRadius) {
-                    qDebug() << "WARNING: ignoring avatar-avatar penetration depth " << penetrationDepth;
-                }
-                else if (penetrationDepth > EPSILON) {
-                    setPosition(getPosition() - BODY_COLLISION_RESOLUTION_FACTOR * collision._penetration);
-                    _lastBodyPenetration += collision._penetration;
-                    emit collisionWithAvatar(getSessionUUID(), avatar->getSessionUUID(), collision);
-                }
+    if (Menu::getInstance()->isOptionChecked(MenuOption::CollideAsRagdoll)) {
+        if (nearestAvatar != NULL) {
+            if (_distanceToNearestAvatar > myBoundingRadius + nearestAvatar->getBoundingRadius()) {
+                // they aren't close enough to put into the _physicsSimulation
+                // so we clear the pointer
+                nearestAvatar = NULL;
             }
-
-            // collide their hands against us
-            avatar->getHand()->collideAgainstAvatar(this, false);
+        }
+    
+        foreach (const AvatarSharedPointer& avatarPointer, avatars) {
+            Avatar* avatar = static_cast<Avatar*>(avatarPointer.data());
+            if (static_cast<Avatar*>(this) == avatar) {
+                // don't collide with ourselves
+                continue;
+            }
+            SkeletonModel* skeleton = &(avatar->getSkeletonModel());
+            PhysicsSimulation* simulation = skeleton->getSimulation();
+            if (avatar == nearestAvatar) {
+                if (simulation != &(_physicsSimulation)) {
+                    skeleton->setEnableShapes(true);
+                    _physicsSimulation.addEntity(skeleton);
+                    _physicsSimulation.addRagdoll(skeleton);
+                }
+            } else if (simulation == &(_physicsSimulation)) {
+                _physicsSimulation.removeRagdoll(skeleton);
+                _physicsSimulation.removeEntity(skeleton);
+                skeleton->setEnableShapes(false);
+            }
         }
     }
 }
@@ -1816,3 +1892,41 @@ void MyAvatar::applyCollision(const glm::vec3& contactPoint, const glm::vec3& pe
     }
 }
 
+//Renders sixense laser pointers for UI selection with controllers
+void MyAvatar::renderLaserPointers() {
+    const float PALM_TIP_ROD_RADIUS = 0.002f;
+
+    //If the Oculus is enabled, we will draw a blue cursor ray
+
+    for (size_t i = 0; i < getHand()->getNumPalms(); ++i) {
+        PalmData& palm = getHand()->getPalms()[i];
+        if (palm.isActive()) {
+            glColor4f(0, 1, 1, 1);
+            glm::vec3 tip = getLaserPointerTipPosition(&palm);
+            glm::vec3 root = palm.getPosition();
+
+            //Scale the root vector with the avatar scale
+            scaleVectorRelativeToPosition(root);
+
+            Avatar::renderJointConnectingCone(root, tip, PALM_TIP_ROD_RADIUS, PALM_TIP_ROD_RADIUS);
+        }
+    }
+}
+
+//Gets the tip position for the laser pointer
+glm::vec3 MyAvatar::getLaserPointerTipPosition(const PalmData* palm) {
+    const ApplicationOverlay& applicationOverlay = Application::getInstance()->getApplicationOverlay();
+    glm::vec3 direction = glm::normalize(palm->getTipPosition() - palm->getPosition());
+
+    glm::vec3 position = palm->getPosition();
+    //scale the position with the avatar
+    scaleVectorRelativeToPosition(position);
+
+
+    glm::vec3 result;
+    if (applicationOverlay.calculateRayUICollisionPoint(position, direction, result)) {
+        return result;
+    }
+
+    return palm->getPosition();
+}

@@ -14,29 +14,36 @@
 #include "BillboardOverlay.h"
 
 BillboardOverlay::BillboardOverlay()
-: _manager(NULL),
+: _fromImage(-1,-1,-1,-1),
   _scale(1.0f),
   _isFacingAvatar(true) {
+      _isLoaded = false;
 }
 
 void BillboardOverlay::render() {
-    if (_billboard.isEmpty()) {
+    if (!_visible || !_isLoaded) {
         return;
     }
-    if (!_billboardTexture) {
-        QImage image = QImage::fromData(_billboard);
-        if (image.format() != QImage::Format_ARGB32) {
-            image = image.convertToFormat(QImage::Format_ARGB32);
+    
+    if (!_billboard.isEmpty()) {
+        if (!_billboardTexture) {
+            QImage image = QImage::fromData(_billboard);
+            if (image.format() != QImage::Format_ARGB32) {
+                image = image.convertToFormat(QImage::Format_ARGB32);
+            }
+            _size = image.size();
+            if (_fromImage.x() == -1) {
+                _fromImage.setRect(0, 0, _size.width(), _size.height());
+            }
+            _billboardTexture.reset(new Texture());
+            glBindTexture(GL_TEXTURE_2D, _billboardTexture->getID());
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _size.width(), _size.height(), 0,
+                         GL_BGRA, GL_UNSIGNED_BYTE, image.constBits());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            
+        } else {
+            glBindTexture(GL_TEXTURE_2D, _billboardTexture->getID());
         }
-        _size = image.size();
-        _billboardTexture.reset(new Texture());
-        glBindTexture(GL_TEXTURE_2D, _billboardTexture->getID());
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _size.width(), _size.height(), 0,
-                     GL_BGRA, GL_UNSIGNED_BYTE, image.constBits());
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        
-    } else {
-        glBindTexture(GL_TEXTURE_2D, _billboardTexture->getID());
     }
     
     glEnable(GL_ALPHA_TEST);
@@ -59,22 +66,27 @@ void BillboardOverlay::render() {
         }
         glScalef(_scale, _scale, _scale);
         
-        float maxSize = glm::max(_size.width(), _size.height());
-        float x = _size.width() / (2.0f * maxSize);
-        float y = -_size.height() / (2.0f * maxSize);
-        
-        glColor3f(1.0f, 1.0f, 1.0f);
-        glBegin(GL_QUADS); {
-            glTexCoord2f(0.0f, 0.0f);
-            glVertex2f(-x, -y);
-            glTexCoord2f(1.0f, 0.0f);
-            glVertex2f(x, -y);
-            glTexCoord2f(1.0f, 1.0f);
-            glVertex2f(x, y);
-            glTexCoord2f(0.0f, 1.0f);
-            glVertex2f(-x, y);
-        } glEnd();
-        
+        if (_billboardTexture) {
+            float maxSize = glm::max(_fromImage.width(), _fromImage.height());
+            float x = _fromImage.width() / (2.0f * maxSize);
+            float y = -_fromImage.height() / (2.0f * maxSize);
+            
+            glColor3f(1.0f, 1.0f, 1.0f);
+            glBegin(GL_QUADS); {
+                glTexCoord2f((float)_fromImage.x() / (float)_size.width(),
+                             (float)_fromImage.y() / (float)_size.height());
+                glVertex2f(-x, -y);
+                glTexCoord2f(((float)_fromImage.x() + (float)_fromImage.width()) / (float)_size.width(),
+                             (float)_fromImage.y() / (float)_size.height());
+                glVertex2f(x, -y);
+                glTexCoord2f(((float)_fromImage.x() + (float)_fromImage.width()) / (float)_size.width(),
+                             ((float)_fromImage.y() + (float)_fromImage.height()) / _size.height());
+                glVertex2f(x, y);
+                glTexCoord2f((float)_fromImage.x() / (float)_size.width(),
+                             ((float)_fromImage.y() + (float)_fromImage.height()) / (float)_size.height());
+                glVertex2f(-x, y);
+            } glEnd();
+        }
     } glPopMatrix();
     
     glDisable(GL_TEXTURE_2D);
@@ -92,6 +104,33 @@ void BillboardOverlay::setProperties(const QScriptValue &properties) {
         _url = urlValue.toVariant().toString();
         
         setBillboardURL(_url);
+    }
+    
+    QScriptValue subImageBounds = properties.property("subImage");
+    if (subImageBounds.isValid()) {
+        QRect oldSubImageRect = _fromImage;
+        QRect subImageRect = _fromImage;
+        if (subImageBounds.property("x").isValid()) {
+            subImageRect.setX(subImageBounds.property("x").toVariant().toInt());
+        } else {
+            subImageRect.setX(oldSubImageRect.x());
+        }
+        if (subImageBounds.property("y").isValid()) {
+            subImageRect.setY(subImageBounds.property("y").toVariant().toInt());
+        } else {
+            subImageRect.setY(oldSubImageRect.y());
+        }
+        if (subImageBounds.property("width").isValid()) {
+            subImageRect.setWidth(subImageBounds.property("width").toVariant().toInt());
+        } else {
+            subImageRect.setWidth(oldSubImageRect.width());
+        }
+        if (subImageBounds.property("height").isValid()) {
+            subImageRect.setHeight(subImageBounds.property("height").toVariant().toInt());
+        } else {
+            subImageRect.setHeight(oldSubImageRect.height());
+        }
+        setClipFromSource(subImageRect);
     }
     
     QScriptValue scaleValue = properties.property("scale");
@@ -119,18 +158,15 @@ void BillboardOverlay::setProperties(const QScriptValue &properties) {
     }
 }
 
-// TODO: handle setting image multiple times, how do we manage releasing the bound texture?
 void BillboardOverlay::setBillboardURL(const QUrl url) {
-    // TODO: are we creating too many QNetworkAccessManager() when multiple calls to setImageURL are made?
-    _manager->deleteLater();
-    _manager = new QNetworkAccessManager();
-    connect(_manager, SIGNAL(finished(QNetworkReply*)), this, SLOT(replyFinished(QNetworkReply*)));
-    _manager->get(QNetworkRequest(url));
+    _isLoaded = false;
+    QNetworkReply* reply = NetworkAccessManager::getInstance().get(QNetworkRequest(url));
+    connect(reply, &QNetworkReply::finished, this, &BillboardOverlay::replyFinished);
 }
 
-void BillboardOverlay::replyFinished(QNetworkReply* reply) {
+void BillboardOverlay::replyFinished() {
     // replace our byte array with the downloaded data
+    QNetworkReply* reply = static_cast<QNetworkReply*>(sender());
     _billboard = reply->readAll();
-    _manager->deleteLater();
-    _manager = NULL;
+    _isLoaded = true;
 }

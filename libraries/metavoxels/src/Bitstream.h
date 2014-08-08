@@ -32,6 +32,7 @@
 class QByteArray;
 class QColor;
 class QDataStream;
+class QScriptEngine;
 class QScriptValue;
 class QUrl;
 
@@ -101,6 +102,9 @@ public:
     void removePersistentValue(V value) { int id = _valueIDs.take(value); _persistentValues.remove(id); }
     
     V takePersistentValue(int id) { V value = _persistentValues.take(id); _valueIDs.remove(value); return value; }
+    
+    void copyPersistentMappings(const RepeatedValueStreamer& other);
+    void clearPersistentMappings();
     
     RepeatedValueStreamer& operator<<(K value);
     RepeatedValueStreamer& operator>>(V& value);
@@ -199,6 +203,29 @@ template<class K, class P, class V> inline RepeatedValueStreamer<K, P, V>&
     return *this;
 }
 
+template<class K, class P, class V> inline void RepeatedValueStreamer<K, P, V>::copyPersistentMappings(
+        const RepeatedValueStreamer<K, P, V>& other) {
+    _lastPersistentID = other._lastPersistentID;
+    _idStreamer.setBitsFromValue(_lastPersistentID);
+    _persistentIDs = other._persistentIDs;
+    _transientOffsets.clear();
+    _lastTransientOffset = 0;
+    _persistentValues = other._persistentValues;
+    _transientValues.clear();
+    _valueIDs = other._valueIDs;
+}
+
+template<class K, class P, class V> inline void RepeatedValueStreamer<K, P, V>::clearPersistentMappings() {
+    _lastPersistentID = 0;
+    _idStreamer.setBitsFromValue(_lastPersistentID);
+    _persistentIDs.clear();
+    _transientOffsets.clear();
+    _lastTransientOffset = 0;
+    _persistentValues.clear();
+    _transientValues.clear();
+    _valueIDs.clear();
+}
+
 /// A stream for bit-aligned data.  Through a combination of code generation, reflection, macros, and templates, provides a
 /// serialization mechanism that may be used for both networking and persistent storage.  For unreliable networking, the
 /// class provides a mapping system that resends mappings for ids until they are acknowledged (and thus persisted).  For
@@ -264,6 +291,11 @@ public:
         QHash<int, SharedObjectPointer> sharedObjectValues;
     };
 
+    /// Performs all of the various lazily initializations (of object streamers, etc.)  If multiple threads need to use
+    /// Bitstream instances, call this beforehand to prevent errors from occurring when multiple threads attempt lazy
+    /// initialization simultaneously.
+    static void preThreadingInit();
+
     /// Registers a metaobject under its name so that instances of it can be streamed.  Consider using the REGISTER_META_OBJECT
     /// at the top level of the source file associated with the class rather than calling this function directly.
     /// \return zero; the function only returns a value so that it can be used in static initialization
@@ -289,6 +321,10 @@ public:
     /// subclasses.
     static QList<const QMetaObject*> getMetaObjectSubClasses(const QMetaObject* metaObject);
 
+    /// Configures the supplied script engine with our registered meta-objects, allowing all of them to be instantiated from
+    /// scripts.
+    static void registerTypes(QScriptEngine* engine);
+
     enum MetadataType { NO_METADATA, HASH_METADATA, FULL_METADATA };
 
     enum GenericsMode { NO_GENERICS, FALLBACK_GENERICS, ALL_GENERICS }; 
@@ -302,6 +338,9 @@ public:
     /// all generics, generics will be created for all non-simple types
     Bitstream(QDataStream& underlying, MetadataType metadataType = NO_METADATA,
         GenericsMode = NO_GENERICS, QObject* parent = NULL);
+
+    /// Returns a reference to the underlying data stream.
+    QDataStream& getUnderlying() { return _underlying; }
 
     /// Substitutes the supplied metaobject for the given class name's default mapping.  This is mostly useful for testing the
     /// process of mapping between different types, but may in the future be used for permanently renaming classes.
@@ -347,6 +386,12 @@ public:
     /// Immediately persists and resets the read mappings.
     void persistAndResetReadMappings();
 
+    /// Copies the persistent mappings from the specified other stream.
+    void copyPersistentMappings(const Bitstream& other);
+
+    /// Clears the persistent mappings for this stream.
+    void clearPersistentMappings();
+
     /// Returns a reference to the weak hash storing shared objects for this stream.
     const WeakSharedObjectHash& getWeakSharedObjectHash() const { return _weakSharedObjectHash; }
 
@@ -384,6 +429,11 @@ public:
     
     template<class K, class V> void writeRawDelta(const QHash<K, V>& value, const QHash<K, V>& reference);
     template<class K, class V> void readRawDelta(QHash<K, V>& value, const QHash<K, V>& reference);
+    
+    /// Writes the specified array aligned on byte boundaries to avoid the inefficiency
+    /// of bit-twiddling (at the cost of up to seven bits of wasted space).
+    void writeAligned(const QByteArray& data);
+    QByteArray readAligned(int bytes);
     
     Bitstream& operator<<(bool value);
     Bitstream& operator>>(bool& value);
@@ -822,6 +872,19 @@ template<class K, class V> inline Bitstream& Bitstream::operator>>(QHash<K, V>& 
     }
     return *this;
 }
+
+/// Thrown for unrecoverable errors.
+class BitstreamException {
+public:
+    
+    BitstreamException(const QString& description);
+
+    const QString& getDescription() const { return _description; }
+
+private:
+    
+    QString _description;
+};
 
 /// Provides a means of writing Bitstream-able data to JSON rather than the usual binary format in a manner that allows it to
 /// be manipulated and re-read, converted to binary, etc.  To use, create a JSONWriter, stream values in using the << operator,

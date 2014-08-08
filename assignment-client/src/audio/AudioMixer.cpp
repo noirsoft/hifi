@@ -38,11 +38,11 @@
 #include <QtCore/QJsonObject>
 #include <QtCore/QJsonValue>
 #include <QtCore/QTimer>
-#include <QtNetwork/QNetworkAccessManager>
 #include <QtNetwork/QNetworkRequest>
 #include <QtNetwork/QNetworkReply>
 
 #include <Logging.h>
+#include <NetworkAccessManager.h>
 #include <NodeList.h>
 #include <Node.h>
 #include <PacketHeaders.h>
@@ -52,8 +52,8 @@
 
 #include "AudioRingBuffer.h"
 #include "AudioMixerClientData.h"
-#include "AvatarAudioRingBuffer.h"
-#include "InjectedAudioRingBuffer.h"
+#include "AvatarAudioStream.h"
+#include "InjectedAudioStream.h"
 
 #include "AudioMixer.h"
 
@@ -61,13 +61,15 @@ const float LOUDNESS_TO_DISTANCE_RATIO = 0.00001f;
 
 const QString AUDIO_MIXER_LOGGING_TARGET_NAME = "audio-mixer";
 
-void attachNewBufferToNode(Node *newNode) {
+void attachNewNodeDataToNode(Node *newNode) {
     if (!newNode->getLinkedData()) {
         newNode->setLinkedData(new AudioMixerClientData());
     }
 }
 
 bool AudioMixer::_useDynamicJitterBuffers = false;
+int AudioMixer::_staticDesiredJitterBufferFrames = 0;
+int AudioMixer::_maxFramesOverDesired = 0;
 
 AudioMixer::AudioMixer(const QByteArray& packet) :
     ThreadedAssignment(packet),
@@ -89,26 +91,31 @@ AudioMixer::~AudioMixer() {
     delete _listenerUnattenuatedZone;
 }
 
-void AudioMixer::addBufferToMixForListeningNodeWithBuffer(PositionalAudioRingBuffer* bufferToAdd,
-                                                          AvatarAudioRingBuffer* listeningNodeBuffer) {
+const float ATTENUATION_BEGINS_AT_DISTANCE = 1.0f;
+const float ATTENUATION_AMOUNT_PER_DOUBLING_IN_DISTANCE = 0.18f;
+const float ATTENUATION_EPSILON_DISTANCE = 0.1f;
+
+void AudioMixer::addStreamToMixForListeningNodeWithStream(PositionalAudioStream* streamToAdd,
+                                                          AvatarAudioStream* listeningNodeStream) {
     float bearingRelativeAngleToSource = 0.0f;
     float attenuationCoefficient = 1.0f;
     int numSamplesDelay = 0;
     float weakChannelAmplitudeRatio = 1.0f;
     
-    bool shouldAttenuate = (bufferToAdd != listeningNodeBuffer);
+    bool shouldAttenuate = (streamToAdd != listeningNodeStream);
     
     if (shouldAttenuate) {
-        // if the two buffer pointers do not match then these are different buffers
-        glm::vec3 relativePosition = bufferToAdd->getPosition() - listeningNodeBuffer->getPosition();
+        
+        // if the two stream pointers do not match then these are different streams
+        glm::vec3 relativePosition = streamToAdd->getPosition() - listeningNodeStream->getPosition();
         
         float distanceBetween = glm::length(relativePosition);
-       
+        
         if (distanceBetween < EPSILON) {
             distanceBetween = EPSILON;
         }
         
-        if (bufferToAdd->getNextOutputTrailingLoudness() / distanceBetween <= _minAudibilityThreshold) {
+        if (streamToAdd->getLastPopOutputTrailingLoudness() / distanceBetween <= _minAudibilityThreshold) {
             // according to mixer performance we have decided this does not get to be mixed in
             // bail out
             return;
@@ -116,20 +123,24 @@ void AudioMixer::addBufferToMixForListeningNodeWithBuffer(PositionalAudioRingBuf
         
         ++_sumMixes;
         
-        if (bufferToAdd->getListenerUnattenuatedZone()) {
-            shouldAttenuate = !bufferToAdd->getListenerUnattenuatedZone()->contains(listeningNodeBuffer->getPosition());
+        if (streamToAdd->getListenerUnattenuatedZone()) {
+            shouldAttenuate = !streamToAdd->getListenerUnattenuatedZone()->contains(listeningNodeStream->getPosition());
         }
         
+        if (streamToAdd->getType() == PositionalAudioStream::Injector) {
+            attenuationCoefficient *= reinterpret_cast<InjectedAudioStream*>(streamToAdd)->getAttenuationRatio();
+        }
+        
+        shouldAttenuate = shouldAttenuate && distanceBetween > ATTENUATION_EPSILON_DISTANCE;
+        
         if (shouldAttenuate) {
-            glm::quat inverseOrientation = glm::inverse(listeningNodeBuffer->getOrientation());
+            glm::quat inverseOrientation = glm::inverse(listeningNodeStream->getOrientation());
             
             float distanceSquareToSource = glm::dot(relativePosition, relativePosition);
             float radius = 0.0f;
             
-            if (bufferToAdd->getType() == PositionalAudioRingBuffer::Injector) {
-                InjectedAudioRingBuffer* injectedBuffer = (InjectedAudioRingBuffer*) bufferToAdd;
-                radius = injectedBuffer->getRadius();
-                attenuationCoefficient *= injectedBuffer->getAttenuationRatio();
+            if (streamToAdd->getType() == PositionalAudioStream::Injector) {
+                radius = reinterpret_cast<InjectedAudioStream*>(streamToAdd)->getRadius();
             }
             
             if (radius == 0 || (distanceSquareToSource > radius * radius)) {
@@ -145,7 +156,7 @@ void AudioMixer::addBufferToMixForListeningNodeWithBuffer(PositionalAudioRingBuf
                     
                 } else {
                     // calculate the angle delivery for off-axis attenuation
-                    glm::vec3 rotatedListenerPosition = glm::inverse(bufferToAdd->getOrientation()) * relativePosition;
+                    glm::vec3 rotatedListenerPosition = glm::inverse(streamToAdd->getOrientation()) * relativePosition;
                     
                     float angleOfDelivery = glm::angle(glm::vec3(0.0f, 0.0f, -1.0f),
                                                        glm::normalize(rotatedListenerPosition));
@@ -154,7 +165,7 @@ void AudioMixer::addBufferToMixForListeningNodeWithBuffer(PositionalAudioRingBuf
                     const float OFF_AXIS_ATTENUATION_FORMULA_STEP = (1 - MAX_OFF_AXIS_ATTENUATION) / 2.0f;
                     
                     float offAxisCoefficient = MAX_OFF_AXIS_ATTENUATION +
-                    (OFF_AXIS_ATTENUATION_FORMULA_STEP * (angleOfDelivery / PI_OVER_TWO));
+                        (OFF_AXIS_ATTENUATION_FORMULA_STEP * (angleOfDelivery / PI_OVER_TWO));
                     
                     // multiply the current attenuation coefficient by the calculated off axis coefficient
                     attenuationCoefficient *= offAxisCoefficient;
@@ -162,19 +173,18 @@ void AudioMixer::addBufferToMixForListeningNodeWithBuffer(PositionalAudioRingBuf
                 
                 glm::vec3 rotatedSourcePosition = inverseOrientation * relativePosition;
                 
-                const float DISTANCE_SCALE = 2.5f;
-                const float GEOMETRIC_AMPLITUDE_SCALAR = 0.3f;
-                const float DISTANCE_LOG_BASE = 2.5f;
-                const float DISTANCE_SCALE_LOG = logf(DISTANCE_SCALE) / logf(DISTANCE_LOG_BASE);
-                
-                // calculate the distance coefficient using the distance to this node
-                float distanceCoefficient = powf(GEOMETRIC_AMPLITUDE_SCALAR,
-                                                 DISTANCE_SCALE_LOG +
-                                                 (0.5f * logf(distanceSquareToSource) / logf(DISTANCE_LOG_BASE)) - 1);
-                distanceCoefficient = std::min(1.0f, distanceCoefficient);
-                
-                // multiply the current attenuation coefficient by the distance coefficient
-                attenuationCoefficient *= distanceCoefficient;
+                if (distanceBetween >= ATTENUATION_BEGINS_AT_DISTANCE) {
+                    // calculate the distance coefficient using the distance to this node
+                    float distanceCoefficient = 1 - (logf(distanceBetween / ATTENUATION_BEGINS_AT_DISTANCE) / logf(2.0f)
+                                                     * ATTENUATION_AMOUNT_PER_DOUBLING_IN_DISTANCE);
+                    
+                    if (distanceCoefficient < 0) {
+                        distanceCoefficient = 0;
+                    }
+                    
+                    // multiply the current attenuation coefficient by the distance coefficient
+                    attenuationCoefficient *= distanceCoefficient;
+                }
                 
                 // project the rotated source position vector onto the XZ plane
                 rotatedSourcePosition.y = 0.0f;
@@ -195,19 +205,16 @@ void AudioMixer::addBufferToMixForListeningNodeWithBuffer(PositionalAudioRingBuf
         }
     }
     
-    const int16_t* nextOutputStart = bufferToAdd->getNextOutput();
+    AudioRingBuffer::ConstIterator streamPopOutput = streamToAdd->getLastPopOutput();
     
-    if (!bufferToAdd->isStereo() && shouldAttenuate) {
-        // this is a mono buffer, which means it gets full attenuation and spatialization
+    if (!streamToAdd->isStereo() && shouldAttenuate) {
+        // this is a mono stream, which means it gets full attenuation and spatialization
         
         // if the bearing relative angle to source is > 0 then the delayed channel is the right one
         int delayedChannelOffset = (bearingRelativeAngleToSource > 0.0f) ? 1 : 0;
         int goodChannelOffset = delayedChannelOffset == 0 ? 1 : 0;
         
-        const int16_t* bufferStart = bufferToAdd->getBuffer();
-        int ringBufferSampleCapacity = bufferToAdd->getSampleCapacity();
-        
-        int16_t correctBufferSample[2], delayBufferSample[2];
+        int16_t correctStreamSample[2], delayStreamSample[2];
         int delayedChannelIndex = 0;
         
         const int SINGLE_STEREO_OFFSET = 2;
@@ -215,150 +222,51 @@ void AudioMixer::addBufferToMixForListeningNodeWithBuffer(PositionalAudioRingBuf
         for (int s = 0; s < NETWORK_BUFFER_LENGTH_SAMPLES_STEREO; s += 4) {
             
             // setup the int16_t variables for the two sample sets
-            correctBufferSample[0] = nextOutputStart[s / 2] * attenuationCoefficient;
-            correctBufferSample[1] = nextOutputStart[(s / 2) + 1] * attenuationCoefficient;
+            correctStreamSample[0] = streamPopOutput[s / 2] * attenuationCoefficient;
+            correctStreamSample[1] = streamPopOutput[(s / 2) + 1] * attenuationCoefficient;
             
             delayedChannelIndex = s + (numSamplesDelay * 2) + delayedChannelOffset;
             
-            delayBufferSample[0] = correctBufferSample[0] * weakChannelAmplitudeRatio;
-            delayBufferSample[1] = correctBufferSample[1] * weakChannelAmplitudeRatio;
+            delayStreamSample[0] = correctStreamSample[0] * weakChannelAmplitudeRatio;
+            delayStreamSample[1] = correctStreamSample[1] * weakChannelAmplitudeRatio;
             
-            __m64 bufferSamples = _mm_set_pi16(_clientSamples[s + goodChannelOffset],
-                                               _clientSamples[s + goodChannelOffset + SINGLE_STEREO_OFFSET],
-                                               _clientSamples[delayedChannelIndex],
-                                               _clientSamples[delayedChannelIndex + SINGLE_STEREO_OFFSET]);
-            __m64 addedSamples = _mm_set_pi16(correctBufferSample[0], correctBufferSample[1],
-                                              delayBufferSample[0], delayBufferSample[1]);
-            
-            // perform the MMX add (with saturation) of two correct and delayed samples
-            __m64 mmxResult = _mm_adds_pi16(bufferSamples, addedSamples);
-            int16_t* shortResults = reinterpret_cast<int16_t*>(&mmxResult);
-            
-            // assign the results from the result of the mmx arithmetic
-            _clientSamples[s + goodChannelOffset] = shortResults[3];
-            _clientSamples[s + goodChannelOffset + SINGLE_STEREO_OFFSET] = shortResults[2];
-            _clientSamples[delayedChannelIndex] = shortResults[1];
-            _clientSamples[delayedChannelIndex + SINGLE_STEREO_OFFSET] = shortResults[0];
+            _clientSamples[s + goodChannelOffset] += correctStreamSample[0];
+            _clientSamples[s + goodChannelOffset + SINGLE_STEREO_OFFSET] += correctStreamSample[1];
+            _clientSamples[delayedChannelIndex] += delayStreamSample[0];
+            _clientSamples[delayedChannelIndex + SINGLE_STEREO_OFFSET] += delayStreamSample[1];
         }
         
-        // The following code is pretty gross and redundant, but AFAIK it's the best way to avoid
-        // too many conditionals in handling the delay samples at the beginning of _clientSamples.
-        // Basically we try to take the samples in batches of four, and then handle the remainder
-        // conditionally to get rid of the rest.
-        
-        const int DOUBLE_STEREO_OFFSET = 4;
-        const int TRIPLE_STEREO_OFFSET = 6;
-        
         if (numSamplesDelay > 0) {
-            // if there was a sample delay for this buffer, we need to pull samples prior to the nextOutput
+            // if there was a sample delay for this stream, we need to pull samples prior to the popped output
             // to stick at the beginning
             float attenuationAndWeakChannelRatio = attenuationCoefficient * weakChannelAmplitudeRatio;
-            const int16_t* delayNextOutputStart = nextOutputStart - numSamplesDelay;
-            if (delayNextOutputStart < bufferStart) {
-                delayNextOutputStart = bufferStart + ringBufferSampleCapacity - numSamplesDelay;
-            }
+            AudioRingBuffer::ConstIterator delayStreamPopOutput = streamPopOutput - numSamplesDelay;
+
+            // TODO: delayStreamPopOutput may be inside the last frame written if the ringbuffer is completely full
+            // maybe make AudioRingBuffer have 1 extra frame in its buffer
             
-            int i = 0;
-            
-            while (i + 3 < numSamplesDelay) {
-                // handle the first cases where we can MMX add four samples at once
+            for (int i = 0; i < numSamplesDelay; i++) {
                 int parentIndex = i * 2;
-                __m64 bufferSamples = _mm_set_pi16(_clientSamples[parentIndex + delayedChannelOffset],
-                                                   _clientSamples[parentIndex + SINGLE_STEREO_OFFSET + delayedChannelOffset],
-                                                   _clientSamples[parentIndex + DOUBLE_STEREO_OFFSET + delayedChannelOffset],
-                                                   _clientSamples[parentIndex + TRIPLE_STEREO_OFFSET + delayedChannelOffset]);
-                __m64 addSamples = _mm_set_pi16(delayNextOutputStart[i] * attenuationAndWeakChannelRatio,
-                                                delayNextOutputStart[i + 1] * attenuationAndWeakChannelRatio,
-                                                delayNextOutputStart[i + 2] * attenuationAndWeakChannelRatio,
-                                                delayNextOutputStart[i + 3] * attenuationAndWeakChannelRatio);
-                __m64 mmxResult = _mm_adds_pi16(bufferSamples, addSamples);
-                int16_t* shortResults = reinterpret_cast<int16_t*>(&mmxResult);
-                
-                _clientSamples[parentIndex + delayedChannelOffset] = shortResults[3];
-                _clientSamples[parentIndex + SINGLE_STEREO_OFFSET + delayedChannelOffset] = shortResults[2];
-                _clientSamples[parentIndex + DOUBLE_STEREO_OFFSET + delayedChannelOffset] = shortResults[1];
-                _clientSamples[parentIndex + TRIPLE_STEREO_OFFSET + delayedChannelOffset] = shortResults[0];
-                
-                // push the index
-                i += 4;
-            }
-            
-            int parentIndex = i * 2;
-            
-            if (i + 2 < numSamplesDelay) {
-                // MMX add only three delayed samples
-                
-                __m64 bufferSamples = _mm_set_pi16(_clientSamples[parentIndex + delayedChannelOffset],
-                                                   _clientSamples[parentIndex + SINGLE_STEREO_OFFSET + delayedChannelOffset],
-                                                   _clientSamples[parentIndex + DOUBLE_STEREO_OFFSET + delayedChannelOffset],
-                                                   0);
-                __m64 addSamples = _mm_set_pi16(delayNextOutputStart[i] * attenuationAndWeakChannelRatio,
-                                                delayNextOutputStart[i + 1] * attenuationAndWeakChannelRatio,
-                                                delayNextOutputStart[i + 2] * attenuationAndWeakChannelRatio,
-                                                0);
-                __m64 mmxResult = _mm_adds_pi16(bufferSamples, addSamples);
-                int16_t* shortResults = reinterpret_cast<int16_t*>(&mmxResult);
-                
-                _clientSamples[parentIndex + delayedChannelOffset] = shortResults[3];
-                _clientSamples[parentIndex + SINGLE_STEREO_OFFSET + delayedChannelOffset] = shortResults[2];
-                _clientSamples[parentIndex + DOUBLE_STEREO_OFFSET + delayedChannelOffset] = shortResults[1];
-                
-            } else if (i + 1 < numSamplesDelay) {
-                // MMX add two delayed samples
-                __m64 bufferSamples = _mm_set_pi16(_clientSamples[parentIndex + delayedChannelOffset],
-                                                   _clientSamples[parentIndex + SINGLE_STEREO_OFFSET + delayedChannelOffset],
-                                                   0, 0);
-                __m64 addSamples = _mm_set_pi16(delayNextOutputStart[i] * attenuationAndWeakChannelRatio,
-                                                delayNextOutputStart[i + 1] * attenuationAndWeakChannelRatio, 0, 0);
-                
-                __m64 mmxResult = _mm_adds_pi16(bufferSamples, addSamples);
-                int16_t* shortResults = reinterpret_cast<int16_t*>(&mmxResult);
-                
-                _clientSamples[parentIndex + delayedChannelOffset] = shortResults[3];
-                _clientSamples[parentIndex + SINGLE_STEREO_OFFSET + delayedChannelOffset] = shortResults[2];
-                
-            } else if (i < numSamplesDelay) {
-                // MMX add a single delayed sample
-                __m64 bufferSamples = _mm_set_pi16(_clientSamples[parentIndex + delayedChannelOffset], 0, 0, 0);
-                __m64 addSamples = _mm_set_pi16(delayNextOutputStart[i] * attenuationAndWeakChannelRatio, 0, 0, 0);
-                
-                __m64 mmxResult = _mm_adds_pi16(bufferSamples, addSamples);
-                int16_t* shortResults = reinterpret_cast<int16_t*>(&mmxResult);
-                
-                _clientSamples[parentIndex + delayedChannelOffset] = shortResults[3];
+                _clientSamples[parentIndex + delayedChannelOffset] += *delayStreamPopOutput * attenuationAndWeakChannelRatio;
+                ++delayStreamPopOutput;
             }
         }
     } else {
-        // this is a stereo buffer or an unattenuated buffer, don't perform spatialization
-        for (int s = 0; s < NETWORK_BUFFER_LENGTH_SAMPLES_STEREO; s += 4) {
-            
-            int stereoDivider = bufferToAdd->isStereo() ? 1 : 2;
-            
-            if (!shouldAttenuate) {
-                attenuationCoefficient = 1.0f;
-            }
-            
-            _clientSamples[s] = glm::clamp(_clientSamples[s]
-                                           + (int) (nextOutputStart[(s / stereoDivider)] * attenuationCoefficient),
-                                           MIN_SAMPLE_VALUE, MAX_SAMPLE_VALUE);
-            _clientSamples[s + 1] = glm::clamp(_clientSamples[s + 1]
-                                               + (int) (nextOutputStart[(s / stereoDivider) + (1 / stereoDivider)]
-                                                        * attenuationCoefficient),
-                                               MIN_SAMPLE_VALUE, MAX_SAMPLE_VALUE);
-            _clientSamples[s + 2] = glm::clamp(_clientSamples[s + 2]
-                                               + (int) (nextOutputStart[(s / stereoDivider) + (2 / stereoDivider)]
-                                                        * attenuationCoefficient),
-                                               MIN_SAMPLE_VALUE, MAX_SAMPLE_VALUE);
-            _clientSamples[s + 3] = glm::clamp(_clientSamples[s + 3]
-                                               + (int) (nextOutputStart[(s / stereoDivider) + (3 / stereoDivider)]
-                                                        * attenuationCoefficient),
-                                               MIN_SAMPLE_VALUE, MAX_SAMPLE_VALUE);
+        int stereoDivider = streamToAdd->isStereo() ? 1 : 2;
+
+        if (!shouldAttenuate) {
+            attenuationCoefficient = 1.0f;
+        }
+
+        for (int s = 0; s < NETWORK_BUFFER_LENGTH_SAMPLES_STEREO; s++) {
+            _clientSamples[s] = glm::clamp(_clientSamples[s] + (int)(streamPopOutput[s / stereoDivider] * attenuationCoefficient),
+                                            MIN_SAMPLE_VALUE, MAX_SAMPLE_VALUE);
         }
     }
 }
 
 void AudioMixer::prepareMixForListeningNode(Node* node) {
-    AvatarAudioRingBuffer* nodeRingBuffer = ((AudioMixerClientData*) node->getLinkedData())->getAvatarAudioRingBuffer();
+    AvatarAudioStream* nodeAudioStream = ((AudioMixerClientData*) node->getLinkedData())->getAvatarAudioStream();
 
     // zero out the client mix for this node
     memset(_clientSamples, 0, NETWORK_BUFFER_LENGTH_BYTES_STEREO);
@@ -370,20 +278,22 @@ void AudioMixer::prepareMixForListeningNode(Node* node) {
             AudioMixerClientData* otherNodeClientData = (AudioMixerClientData*) otherNode->getLinkedData();
 
             // enumerate the ARBs attached to the otherNode and add all that should be added to mix
-            for (int i = 0; i < otherNodeClientData->getRingBuffers().size(); i++) {
-                PositionalAudioRingBuffer* otherNodeBuffer = otherNodeClientData->getRingBuffers()[i];
 
-                if ((*otherNode != *node
-                     || otherNodeBuffer->shouldLoopbackForNode())
-                    && otherNodeBuffer->willBeAddedToMix()
-                    && otherNodeBuffer->getNextOutputTrailingLoudness() > 0) {
-                    addBufferToMixForListeningNodeWithBuffer(otherNodeBuffer, nodeRingBuffer);
+            const QHash<QUuid, PositionalAudioStream*>& otherNodeAudioStreams = otherNodeClientData->getAudioStreams();
+            QHash<QUuid, PositionalAudioStream*>::ConstIterator i;
+            for (i = otherNodeAudioStreams.begin(); i != otherNodeAudioStreams.constEnd(); i++) {
+                PositionalAudioStream* otherNodeStream = i.value();
+
+                if ((*otherNode != *node || otherNodeStream->shouldLoopbackForNode())
+                    && otherNodeStream->lastPopSucceeded()
+                    && otherNodeStream->getLastPopOutputTrailingLoudness() > 0.0f) {
+
+                    addStreamToMixForListeningNodeWithStream(otherNodeStream, nodeAudioStream);
                 }
             }
         }
     }
 }
-
 
 void AudioMixer::readPendingDatagrams() {
     QByteArray receivedPacket;
@@ -397,7 +307,8 @@ void AudioMixer::readPendingDatagrams() {
             if (mixerPacketType == PacketTypeMicrophoneAudioNoEcho
                 || mixerPacketType == PacketTypeMicrophoneAudioWithEcho
                 || mixerPacketType == PacketTypeInjectAudio
-                || mixerPacketType == PacketTypeSilentAudioFrame) {
+                || mixerPacketType == PacketTypeSilentAudioFrame
+                || mixerPacketType == PacketTypeAudioStreamStats) {
                 
                 nodeList->findNodeAndUpdateWithDataFromPacket(receivedPacket);
             } else if (mixerPacketType == PacketTypeMuteEnvironment) {
@@ -420,6 +331,8 @@ void AudioMixer::readPendingDatagrams() {
 
 void AudioMixer::sendStatsPacket() {
     static QJsonObject statsObject;
+    
+    statsObject["useDynamicJitterBuffers"] = _useDynamicJitterBuffers;
     statsObject["trailing_sleep_percentage"] = _trailingSleepRatio * 100.0f;
     statsObject["performance_throttling_ratio"] = _performanceThrottlingRatio;
 
@@ -480,43 +393,27 @@ void AudioMixer::run() {
 
     nodeList->addNodeTypeToInterestSet(NodeType::Agent);
 
-    nodeList->linkedDataCreateCallback = attachNewBufferToNode;
+    nodeList->linkedDataCreateCallback = attachNewNodeDataToNode;
     
-    // setup a QNetworkAccessManager to ask the domain-server for our settings
-    QNetworkAccessManager *networkManager = new QNetworkAccessManager(this);
+    // wait until we have the domain-server settings, otherwise we bail
+    DomainHandler& domainHandler = nodeList->getDomainHandler();
     
-    QUrl settingsJSONURL;
-    settingsJSONURL.setScheme("http");
-    settingsJSONURL.setHost(nodeList->getDomainHandler().getHostname());
-    settingsJSONURL.setPort(DOMAIN_SERVER_HTTP_PORT);
-    settingsJSONURL.setPath("/settings.json");
-    settingsJSONURL.setQuery(QString("type=%1").arg(_type));
+    qDebug() << "Waiting for domain settings from domain-server.";
     
-    QNetworkReply *reply = NULL;
+    // block until we get the settingsRequestComplete signal
+    QEventLoop loop;
+    connect(&domainHandler, &DomainHandler::settingsReceived, &loop, &QEventLoop::quit);
+    connect(&domainHandler, &DomainHandler::settingsReceiveFail, &loop, &QEventLoop::quit);
+    domainHandler.requestDomainSettings();
+    loop.exec();
     
-    int failedAttempts = 0;
-    const int MAX_SETTINGS_REQUEST_FAILED_ATTEMPTS = 5;
-    
-    qDebug() << "Requesting settings for assignment from domain-server at" << settingsJSONURL.toString();
-    
-    while (!reply || reply->error() != QNetworkReply::NoError) {
-        reply = networkManager->get(QNetworkRequest(settingsJSONURL));
-        
-        QEventLoop loop;
-        QObject::connect(reply, SIGNAL(finished()), &loop, SLOT(quit()));
-        
-        loop.exec();
-        
-        ++failedAttempts;
-        
-        if (failedAttempts == MAX_SETTINGS_REQUEST_FAILED_ATTEMPTS) {
-            qDebug() << "Failed to get settings from domain-server. Bailing on assignment.";
-            setFinished(true);
-            return;
-        }
+    if (domainHandler.getSettingsObject().isEmpty()) {
+        qDebug() << "Failed to retreive settings object from domain-server. Bailing on assignment.";
+        setFinished(true);
+        return;
     }
     
-    QJsonObject settingsObject = QJsonDocument::fromJson(reply->readAll()).object();
+    const QJsonObject& settingsObject = domainHandler.getSettingsObject();
     
     // check the settings object to see if we have anything we can parse out
     const QString AUDIO_GROUP_KEY = "audio";
@@ -524,38 +421,57 @@ void AudioMixer::run() {
     if (settingsObject.contains(AUDIO_GROUP_KEY)) {
         QJsonObject audioGroupObject = settingsObject[AUDIO_GROUP_KEY].toObject();
         
-        const QString UNATTENUATED_ZONE_KEY = "unattenuated-zone";
-        
-        QString unattenuatedZoneString = audioGroupObject[UNATTENUATED_ZONE_KEY].toString();
-        if (!unattenuatedZoneString.isEmpty()) {
-            QStringList zoneStringList = unattenuatedZoneString.split(',');
-            
-            glm::vec3 sourceCorner(zoneStringList[0].toFloat(), zoneStringList[1].toFloat(), zoneStringList[2].toFloat());
-            glm::vec3 sourceDimensions(zoneStringList[3].toFloat(), zoneStringList[4].toFloat(), zoneStringList[5].toFloat());
-            
-            glm::vec3 listenerCorner(zoneStringList[6].toFloat(), zoneStringList[7].toFloat(), zoneStringList[8].toFloat());
-            glm::vec3 listenerDimensions(zoneStringList[9].toFloat(), zoneStringList[10].toFloat(), zoneStringList[11].toFloat());
-            
-            _sourceUnattenuatedZone = new AABox(sourceCorner, sourceDimensions);
-            _listenerUnattenuatedZone = new AABox(listenerCorner, listenerDimensions);
-            
-            glm::vec3 sourceCenter = _sourceUnattenuatedZone->calcCenter();
-            glm::vec3 destinationCenter = _listenerUnattenuatedZone->calcCenter();
-            
-            qDebug() << "There is an unattenuated zone with source center at"
-            << QString("%1, %2, %3").arg(sourceCenter.x).arg(sourceCenter.y).arg(sourceCenter.z);
-            qDebug() << "Buffers inside this zone will not be attenuated inside a box with center at"
-            << QString("%1, %2, %3").arg(destinationCenter.x).arg(destinationCenter.y).arg(destinationCenter.z);
-        }
-        
         // check the payload to see if we have asked for dynamicJitterBuffer support
-        const QString DYNAMIC_JITTER_BUFFER_JSON_KEY = "dynamic-jitter-buffer";
+        const QString DYNAMIC_JITTER_BUFFER_JSON_KEY = "A-dynamic-jitter-buffer";
         bool shouldUseDynamicJitterBuffers = audioGroupObject[DYNAMIC_JITTER_BUFFER_JSON_KEY].toBool();
         if (shouldUseDynamicJitterBuffers) {
             qDebug() << "Enable dynamic jitter buffers.";
             _useDynamicJitterBuffers = true;
         } else {
-            qDebug() << "Dynamic jitter buffers disabled, using old behavior.";
+            qDebug() << "Dynamic jitter buffers disabled.";
+            _useDynamicJitterBuffers = false;
+        }
+
+        bool ok;
+
+        const QString DESIRED_JITTER_BUFFER_FRAMES_KEY = "B-desired-jitter-buffer-frames";
+        _staticDesiredJitterBufferFrames = audioGroupObject[DESIRED_JITTER_BUFFER_FRAMES_KEY].toString().toInt(&ok);
+        if (!ok) {
+            _staticDesiredJitterBufferFrames = DEFAULT_DESIRED_JITTER_BUFFER_FRAMES;
+        }
+        qDebug() << "Static desired jitter buffer frames:" << _staticDesiredJitterBufferFrames;
+
+        const QString MAX_FRAMES_OVER_DESIRED_JSON_KEY = "C-max-frames-over-desired";
+        _maxFramesOverDesired = audioGroupObject[MAX_FRAMES_OVER_DESIRED_JSON_KEY].toString().toInt(&ok);
+        if (!ok) {
+            _maxFramesOverDesired = DEFAULT_MAX_FRAMES_OVER_DESIRED;
+        }
+        qDebug() << "Max frames over desired:" << _maxFramesOverDesired;
+
+
+
+        const QString UNATTENUATED_ZONE_KEY = "D-unattenuated-zone";
+
+        QString unattenuatedZoneString = audioGroupObject[UNATTENUATED_ZONE_KEY].toString();
+        if (!unattenuatedZoneString.isEmpty()) {
+            QStringList zoneStringList = unattenuatedZoneString.split(',');
+
+            glm::vec3 sourceCorner(zoneStringList[0].toFloat(), zoneStringList[1].toFloat(), zoneStringList[2].toFloat());
+            glm::vec3 sourceDimensions(zoneStringList[3].toFloat(), zoneStringList[4].toFloat(), zoneStringList[5].toFloat());
+
+            glm::vec3 listenerCorner(zoneStringList[6].toFloat(), zoneStringList[7].toFloat(), zoneStringList[8].toFloat());
+            glm::vec3 listenerDimensions(zoneStringList[9].toFloat(), zoneStringList[10].toFloat(), zoneStringList[11].toFloat());
+
+            _sourceUnattenuatedZone = new AABox(sourceCorner, sourceDimensions);
+            _listenerUnattenuatedZone = new AABox(listenerCorner, listenerDimensions);
+
+            glm::vec3 sourceCenter = _sourceUnattenuatedZone->calcCenter();
+            glm::vec3 destinationCenter = _listenerUnattenuatedZone->calcCenter();
+
+            qDebug() << "There is an unattenuated zone with source center at"
+                << QString("%1, %2, %3").arg(sourceCenter.x).arg(sourceCenter.y).arg(sourceCenter.z);
+            qDebug() << "Buffers inside this zone will not be attenuated inside a box with center at"
+                << QString("%1, %2, %3").arg(destinationCenter.x).arg(destinationCenter.y).arg(destinationCenter.z);
         }
     }
     
@@ -572,14 +488,6 @@ void AudioMixer::run() {
     int framesSinceCutoffEvent = TRAILING_AVERAGE_FRAMES;
 
     while (!_isFinished) {
-        
-        foreach (const SharedNodePointer& node, nodeList->getNodeHash()) {
-            if (node->getLinkedData()) {
-                ((AudioMixerClientData*) node->getLinkedData())->checkBuffersBeforeFrameSend(_sourceUnattenuatedZone,
-                                                                                             _listenerUnattenuatedZone);
-            }
-        }
-        
         const float STRUGGLE_TRIGGER_SLEEP_PERCENTAGE_THRESHOLD = 0.10f;
         const float BACK_OFF_TRIGGER_SLEEP_PERCENTAGE_THRESHOLD = 0.20f;
         
@@ -632,9 +540,6 @@ void AudioMixer::run() {
             ++framesSinceCutoffEvent;
         }
         
-
-        const quint64 TOO_LONG_SINCE_LAST_SEND_AUDIO_STREAM_STATS = 1 * USECS_PER_SECOND;
-        
         bool sendAudioStreamStats = false;
         quint64 now = usecTimestampNow();
         if (now - _lastSendAudioStreamStatsTime > TOO_LONG_SINCE_LAST_SEND_AUDIO_STREAM_STATS) {
@@ -643,43 +548,43 @@ void AudioMixer::run() {
         }
 
         foreach (const SharedNodePointer& node, nodeList->getNodeHash()) {
-            if (node->getType() == NodeType::Agent && node->getActiveSocket() && node->getLinkedData()
-                && ((AudioMixerClientData*) node->getLinkedData())->getAvatarAudioRingBuffer()) {
-
+            if (node->getLinkedData()) {
                 AudioMixerClientData* nodeData = (AudioMixerClientData*)node->getLinkedData();
 
-                prepareMixForListeningNode(node.data());
-                
-                // pack header
-                int numBytesPacketHeader = populatePacketHeader(clientMixBuffer, PacketTypeMixedAudio);
-                char* dataAt = clientMixBuffer + numBytesPacketHeader;
+                // this function will attempt to pop a frame from each audio stream.
+                // a pointer to the popped data is stored as a member in InboundAudioStream.
+                // That's how the popped audio data will be read for mixing (but only if the pop was successful)
+                nodeData->checkBuffersBeforeFrameSend(_sourceUnattenuatedZone, _listenerUnattenuatedZone);
+            
+                if (node->getType() == NodeType::Agent && node->getActiveSocket()
+                    && nodeData->getAvatarAudioStream()) {
 
-                // pack sequence number
-                quint16 sequence = nodeData->getOutgoingSequenceNumber();
-                memcpy(dataAt, &sequence, sizeof(quint16));
-                dataAt += sizeof(quint16);
+                    prepareMixForListeningNode(node.data());
 
-                // pack mixed audio samples
-                memcpy(dataAt, _clientSamples, NETWORK_BUFFER_LENGTH_BYTES_STEREO);
-                dataAt += NETWORK_BUFFER_LENGTH_BYTES_STEREO;
+                    // pack header
+                    int numBytesPacketHeader = populatePacketHeader(clientMixBuffer, PacketTypeMixedAudio);
+                    char* dataAt = clientMixBuffer + numBytesPacketHeader;
 
-                // send mixed audio packet
-                nodeList->writeDatagram(clientMixBuffer, dataAt - clientMixBuffer, node);
-                nodeData->incrementOutgoingMixedAudioSequenceNumber();
-                
-                // send an audio stream stats packet if it's time
-                if (sendAudioStreamStats) {
-                    nodeData->sendAudioStreamStatsPackets(node);
+                    // pack sequence number
+                    quint16 sequence = nodeData->getOutgoingSequenceNumber();
+                    memcpy(dataAt, &sequence, sizeof(quint16));
+                    dataAt += sizeof(quint16);
+
+                    // pack mixed audio samples
+                    memcpy(dataAt, _clientSamples, NETWORK_BUFFER_LENGTH_BYTES_STEREO);
+                    dataAt += NETWORK_BUFFER_LENGTH_BYTES_STEREO;
+
+                    // send mixed audio packet
+                    nodeList->writeDatagram(clientMixBuffer, dataAt - clientMixBuffer, node);
+                    nodeData->incrementOutgoingMixedAudioSequenceNumber();
+
+                    // send an audio stream stats packet if it's time
+                    if (sendAudioStreamStats) {
+                        nodeData->sendAudioStreamStatsPackets(node);
+                    }
+
+                    ++_sumListeners;
                 }
-
-                ++_sumListeners;
-            }
-        }
-        
-        // push forward the next output pointers for any audio buffers we used
-        foreach (const SharedNodePointer& node, nodeList->getNodeHash()) {
-            if (node->getLinkedData()) {
-                ((AudioMixerClientData*) node->getLinkedData())->pushBuffersAfterFrameSend();
             }
         }
         

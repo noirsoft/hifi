@@ -331,6 +331,7 @@ ModelItem ModelItem::fromEditPacket(const unsigned char* data, int length, int& 
 
         newModelItem.setCreatorTokenID(creatorTokenID);
         newModelItem._newlyCreated = true;
+        valid = true;
 
     } else {
         // look up the existing modelItem
@@ -339,20 +340,19 @@ ModelItem ModelItem::fromEditPacket(const unsigned char* data, int length, int& 
         // copy existing properties before over-writing with new properties
         if (existingModelItem) {
             newModelItem = *existingModelItem;
+            valid = true;
         } else {
             // the user attempted to edit a modelItem that doesn't exist
-            qDebug() << "user attempted to edit a modelItem that doesn't exist...";
+            qDebug() << "user attempted to edit a modelItem that doesn't exist... editID=" << editID;
+
+            // NOTE: even though this is a bad editID, we have to consume the edit details, so that
+            // the buffer doesn't get corrupted for further processing...
             valid = false;
-            return newModelItem;
         }
         newModelItem._id = editID;
         newModelItem._newlyCreated = false;
     }
     
-    // if we got this far, then our result will be valid
-    valid = true;
-    
-
     // lastEdited
     memcpy(&newModelItem._lastEdited, dataAt, sizeof(newModelItem._lastEdited));
     dataAt += sizeof(newModelItem._lastEdited);
@@ -1155,6 +1155,38 @@ void ModelItemProperties::copyFromModelItem(const ModelItem& modelItem) {
     _animationFPSChanged = false;
     _glowLevelChanged = false;
     _defaultSettings = false;
+}
+
+void ModelItemProperties::copyFromNewModelItem(const ModelItem& modelItem) {
+    _position = modelItem.getPosition() * (float) TREE_SCALE;
+    _color = modelItem.getXColor();
+    _radius = modelItem.getRadius() * (float) TREE_SCALE;
+    _shouldDie = modelItem.getShouldDie();
+    _modelURL = modelItem.getModelURL();
+    _modelRotation = modelItem.getModelRotation();
+    _animationURL = modelItem.getAnimationURL();
+    _animationIsPlaying = modelItem.getAnimationIsPlaying();
+    _animationFrameIndex = modelItem.getAnimationFrameIndex();
+    _animationFPS = modelItem.getAnimationFPS();
+    _glowLevel = modelItem.getGlowLevel();
+    _sittingPoints = modelItem.getSittingPoints();
+
+    _id = modelItem.getID();
+    _idSet = true;
+
+    _positionChanged = true;
+    _colorChanged = true;
+    _radiusChanged = true;
+    
+    _shouldDieChanged = true;
+    _modelURLChanged = true;
+    _modelRotationChanged = true;
+    _animationURLChanged = true;
+    _animationIsPlayingChanged = true;
+    _animationFrameIndexChanged = true;
+    _animationFPSChanged = true;
+    _glowLevelChanged = true;
+    _defaultSettings = true;
 }
 
 QScriptValue ModelItemPropertiesToScriptValue(QScriptEngine* engine, const ModelItemProperties& properties) {

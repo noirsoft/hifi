@@ -136,6 +136,8 @@ void PreferencesDialog::loadPreferences() {
 
     _skeletonURLString = myAvatar->getSkeletonModel().getURL().toString();
     ui.skeletonURLEdit->setText(_skeletonURLString);
+    
+    ui.sendDataCheckBox->setChecked(!menuInstance->isOptionChecked(MenuOption::DisableActivityLogger));
 
     ui.snapshotLocationEdit->setText(menuInstance->getSnapshotsLocation());
 
@@ -147,7 +149,9 @@ void PreferencesDialog::loadPreferences() {
     ui.faceshiftEyeDeflectionSider->setValue(menuInstance->getFaceshiftEyeDeflection() *
                                              ui.faceshiftEyeDeflectionSider->maximum());
     
-    ui.audioJitterSpin->setValue(menuInstance->getAudioJitterBufferSamples());
+    ui.audioJitterSpin->setValue(menuInstance->getAudioJitterBufferFrames());
+
+    ui.maxFramesOverDesiredSpin->setValue(menuInstance->getMaxFramesOverDesired());
 
     ui.realWorldFieldOfViewSpin->setValue(menuInstance->getRealWorldFieldOfView());
 
@@ -201,6 +205,11 @@ void PreferencesDialog::savePreferences() {
         myAvatar->sendIdentityPacket();
         Application::getInstance()->bumpSettings();
     }
+    
+    if (!Menu::getInstance()->isOptionChecked(MenuOption::DisableActivityLogger)
+        != ui.sendDataCheckBox->isChecked()) {
+        Menu::getInstance()->triggerOption(MenuOption::DisableActivityLogger);
+    }
 
     if (!ui.snapshotLocationEdit->text().isEmpty() && QDir(ui.snapshotLocationEdit->text()).exists()) {
         Menu::getInstance()->setSnapshotsLocation(ui.snapshotLocationEdit->text());
@@ -232,8 +241,16 @@ void PreferencesDialog::savePreferences() {
 
     Menu::getInstance()->setInvertSixenseButtons(ui.invertSixenseButtonsCheckBox->isChecked());
 
-    Menu::getInstance()->setAudioJitterBufferSamples(ui.audioJitterSpin->value());
-    Application::getInstance()->getAudio()->setJitterBufferSamples(ui.audioJitterSpin->value());
+    Menu::getInstance()->setAudioJitterBufferFrames(ui.audioJitterSpin->value());
+    if (Menu::getInstance()->getAudioJitterBufferFrames() != 0) {
+        Application::getInstance()->getAudio()->setDynamicJitterBuffers(false);
+        Application::getInstance()->getAudio()->setStaticDesiredJitterBufferFrames(Menu::getInstance()->getAudioJitterBufferFrames());
+    } else {
+        Application::getInstance()->getAudio()->setDynamicJitterBuffers(true);
+    }
+
+    Menu::getInstance()->setMaxFramesOverDesired(ui.maxFramesOverDesiredSpin->value());
+    Application::getInstance()->getAudio()->setMaxFramesOverDesired(Menu::getInstance()->getMaxFramesOverDesired());
 
     Application::getInstance()->resizeGL(Application::getInstance()->getGLWidget()->width(),
                                          Application::getInstance()->getGLWidget()->height());

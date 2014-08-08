@@ -189,7 +189,7 @@ bool sphereCapsule(const SphereShape* sphereA, const CapsuleShape* capsuleB, Col
     glm::vec3 capsuleAxis; 
     capsuleB->computeNormalizedAxis(capsuleAxis);
     float axialDistance = - glm::dot(BA, capsuleAxis);
-    float absAxialDistance = fabs(axialDistance);
+    float absAxialDistance = fabsf(axialDistance);
     float totalRadius = sphereA->getRadius() + capsuleB->getRadius();
     if (absAxialDistance < totalRadius + capsuleB->getHalfHeight()) {
         glm::vec3 radialAxis = BA + axialDistance * capsuleAxis; // points from A to axis of B
@@ -274,7 +274,7 @@ bool capsuleSphere(const CapsuleShape* capsuleA, const SphereShape* sphereB, Col
     glm::vec3 capsuleAxis;
     capsuleA->computeNormalizedAxis(capsuleAxis);
     float axialDistance = - glm::dot(AB, capsuleAxis);
-    float absAxialDistance = fabs(axialDistance);
+    float absAxialDistance = fabsf(axialDistance);
     float totalRadius = sphereB->getRadius() + capsuleA->getRadius();
     if (absAxialDistance < totalRadius + capsuleA->getHalfHeight()) {
         glm::vec3 radialAxis = AB + axialDistance * capsuleAxis; // from sphereB to axis of capsuleA
@@ -343,6 +343,72 @@ bool capsuleSphere(const CapsuleShape* capsuleA, const SphereShape* sphereB, Col
     return false;
 }
 
+/// \param lineP point on line
+/// \param lineDir normalized direction of line
+/// \param cylinderP point on cylinder axis
+/// \param cylinderDir normalized direction of cylinder axis
+/// \param cylinderRadius radius of cylinder
+/// \param hitLow[out] distance from point on line to first intersection with cylinder
+/// \param hitHigh[out] distance from point on line to second intersection with cylinder
+/// \return true if line hits cylinder
+bool lineCylinder(const glm::vec3& lineP, const glm::vec3& lineDir, 
+        const glm::vec3& cylinderP, const glm::vec3& cylinderDir, float cylinderRadius,
+        float& hitLow, float& hitHigh) {
+
+    // first handle parallel case
+    float uDotV = glm::dot(lineDir, cylinderDir);
+    if (fabsf(1.0f - fabsf(uDotV)) < EPSILON) {
+        // line and cylinder are parallel
+        if (glm::distance2(lineP, cylinderP) <= cylinderRadius * cylinderRadius) {
+            // line is inside cylinder, which we consider a hit
+            hitLow = 0.0f;
+            hitHigh = 0.0f;
+            return true;
+        }
+        return false;
+    }
+    
+    // Given a line with point 'p' and normalized direction 'u' and 
+    // a cylinder with axial point 's', radius 'r', and normalized direction 'v'
+    // the intersection of the two is on the line at distance 't' from 'p'.
+    //
+    // Determining the values of t reduces to solving a quadratic equation: At^2 + Bt + C = 0 
+    //
+    // where:
+    //
+    // P = p-s
+    // w = u-(u.v)v
+    // Q = P-(P.v)v
+    //       
+    // A = w^2
+    // B = 2(w.Q)
+    // C = Q^2 - r^2
+
+    glm::vec3 P = lineP - cylinderP;
+    glm::vec3 w = lineDir - uDotV * cylinderDir;
+    glm::vec3 Q = P - glm::dot(P, cylinderDir) * cylinderDir;
+
+    // we save a few multiplies by storing 2*A rather than just A
+    float A2 = 2.0f * glm::dot(w, w);
+    float B = 2.0f * glm::dot(w, Q);
+
+    // since C is only ever used once (in the determinant) we compute it inline
+    float determinant = B * B - 2.0f * A2 * (glm::dot(Q, Q) - cylinderRadius * cylinderRadius);
+    if (determinant < 0.0f) {
+        return false;
+    }
+    hitLow  = (-B - sqrtf(determinant)) / A2;
+    hitHigh = -(hitLow + 2.0f * B / A2);
+
+    if (hitLow > hitHigh) {
+        // re-arrange so hitLow is always the smaller value
+        float temp = hitHigh;
+        hitHigh = hitLow;
+        hitLow = temp;
+    }
+    return true;
+}
+
 bool capsuleCapsule(const CapsuleShape* capsuleA, const CapsuleShape* capsuleB, CollisionList& collisions) {
     glm::vec3 axisA;
     capsuleA->computeNormalizedAxis(axisA);
@@ -358,23 +424,43 @@ bool capsuleCapsule(const CapsuleShape* capsuleA, const CapsuleShape* capsuleB, 
     float denominator = 1.0f - aDotB * aDotB;
     float totalRadius = capsuleA->getRadius() + capsuleB->getRadius();
     if (denominator > EPSILON) {
-        // distances to points of closest approach
-        float distanceA = glm::dot((centerB - centerA), (axisA - (aDotB) * axisB)) / denominator;
-        float distanceB = glm::dot((centerA - centerB), (axisB - (aDotB) * axisA)) / denominator;
-        
-        // clamp the distances to the ends of the capsule line segments
-        float absDistanceA = fabs(distanceA);
-        if (absDistanceA > capsuleA->getHalfHeight() + capsuleA->getRadius()) {
-            float signA = distanceA < 0.0f ? -1.0f : 1.0f;
-            distanceA = signA * capsuleA->getHalfHeight();
-        }
-        float absDistanceB = fabs(distanceB);
-        if (absDistanceB > capsuleB->getHalfHeight() + capsuleB->getRadius()) {
-            float signB = distanceB < 0.0f ? -1.0f : 1.0f;
-            distanceB = signB * capsuleB->getHalfHeight();
+        // perform line-cylinder intesection test between axis of cylinderA and cylinderB with exanded radius
+        float hitLow = 0.0f;
+        float hitHigh = 0.0f;
+        if (!lineCylinder(centerA, axisA, centerB, axisB, totalRadius, hitLow, hitHigh)) {
+            return false;
         }
 
-        // collide like spheres at closest approaches (do most of the math relative to B)
+        float halfHeightA = capsuleA->getHalfHeight();
+        if (hitLow > halfHeightA || hitHigh < -halfHeightA) {
+            // the intersections are off the ends of capsuleA
+            return false;
+        }
+
+        // compute nearest approach on axisA of axisB
+        float distanceA = glm::dot((centerB - centerA), (axisA - (aDotB) * axisB)) / denominator;
+        // clamp to intersection zone
+        if (distanceA > hitLow) {
+            if (distanceA > hitHigh) {
+                distanceA = hitHigh;
+            }
+        } else {
+            distanceA = hitLow;
+        }
+        // clamp to capsule segment
+        distanceA = glm::clamp(distanceA, -halfHeightA, halfHeightA);
+
+        // find the closest point on capsuleB to sphere on capsuleA
+        float distanceB = glm::dot(centerA + distanceA * axisA - centerB, axisB);
+        float halfHeightB = capsuleB->getHalfHeight();
+        if (fabsf(distanceB) > halfHeightB) {
+            // we must clamp distanceB...
+            distanceB = glm::clamp(distanceB, -halfHeightB, halfHeightB);
+            // ...and therefore must recompute distanceA
+            distanceA = glm::clamp(glm::dot(centerB + distanceB * axisB - centerA, axisA), -halfHeightA, halfHeightA);
+        }
+
+        // collide like two spheres (do most of the math relative to B)
         glm::vec3 BA = (centerB + distanceB * axisB) - (centerA + distanceA * axisA);
         float distanceSquared = glm::dot(BA, BA);
         if (distanceSquared < totalRadius * totalRadius) {
@@ -415,7 +501,7 @@ bool capsuleCapsule(const CapsuleShape* capsuleA, const CapsuleShape* capsuleB, 
         // capsules are approximiately parallel but might still collide
         glm::vec3 BA = centerB - centerA;
         float axialDistance = glm::dot(BA, axisB);
-        if (axialDistance > totalRadius + capsuleA->getHalfHeight() + capsuleB->getHalfHeight()) {
+        if (fabsf(axialDistance) > totalRadius + capsuleA->getHalfHeight() + capsuleB->getHalfHeight()) {
             return false;
         }
         BA = BA - axialDistance * axisB;     // BA now points from centerA to axisB (perp to axis)
@@ -761,7 +847,7 @@ bool sphereAACube_StarkAngles(const glm::vec3& sphereCenter, float sphereRadius,
         // compute the nearest point on sphere
         glm::vec3 surfaceA = sphereCenter + sphereRadius * BA;
         // compute the nearest point on cube
-        float maxBA = glm::max(glm::max(fabs(BA.x), fabs(BA.y)), fabs(BA.z));
+        float maxBA = glm::max(glm::max(fabsf(BA.x), fabsf(BA.y)), fabsf(BA.z));
         glm::vec3 surfaceB = cubeCenter - (0.5f * cubeSide / maxBA) * BA;
         // collision happens when "vector to surfaceA from surfaceB" dots with BA to produce a positive value
         glm::vec3 surfaceAB = surfaceA - surfaceB;

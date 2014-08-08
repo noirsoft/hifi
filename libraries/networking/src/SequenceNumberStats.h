@@ -13,41 +13,86 @@
 #define hifi_SequenceNumberStats_h
 
 #include "SharedUtil.h"
+#include "RingBufferHistory.h"
 #include <quuid.h>
+
+const int MAX_REASONABLE_SEQUENCE_GAP = 1000;
+
+
+class PacketStreamStats {
+public:
+    PacketStreamStats()
+        : _received(0),
+        _unreasonable(0),
+        _early(0),
+        _late(0),
+        _lost(0),
+        _recovered(0),
+        _expectedReceived(0)
+    {}
+
+    float getLostRate() const { return (float)_lost / _expectedReceived; }
+
+    quint32 _received;
+    quint32 _unreasonable;
+    quint32 _early;
+    quint32 _late;
+    quint32 _lost;
+    quint32 _recovered;
+    quint32 _expectedReceived;
+};
 
 class SequenceNumberStats {
 public:
-    SequenceNumberStats();
+    enum ArrivalStatus {
+        OnTime,
+        Unreasonable,
+        Early,
+        Recovered,
+    };
+
+    class ArrivalInfo {
+    public:
+        ArrivalStatus _status;
+        int _seqDiffFromExpected;
+    };
+
+
+    SequenceNumberStats(int statsHistoryLength = 0, bool canDetectOutOfSync = true);
 
     void reset();
+    ArrivalInfo sequenceNumberReceived(quint16 incoming, QUuid senderUUID = QUuid(), const bool wantExtraDebugging = false);
+    void pruneMissingSet(const bool wantExtraDebugging = false);
+    void pushStatsToHistory() { _statsHistory.insert(_stats); }
 
-    void sequenceNumberReceived(quint16 incoming, QUuid senderUUID = QUuid(), const bool wantExtraDebugging = false);
+    quint32 getReceived() const { return _stats._received; }
+    quint32 getExpectedReceived() const { return _stats._expectedReceived; }
+    quint32 getUnreasonable() const { return _stats._unreasonable; }
+    quint32 getOutOfOrder() const { return _stats._early + _stats._late; }
+    quint32 getEarly() const { return _stats._early; }
+    quint32 getLate() const { return _stats._late; }
+    quint32 getLost() const { return _stats._lost; }
+    quint32 getRecovered() const { return _stats._recovered; }
 
-    quint32 getNumReceived() const { return _numReceived; }
-    quint32 getNumUnreasonable() const { return _numUnreasonable; }
-    quint32 getNumOutOfOrder() const { return _numEarly + _numLate; }
-    quint32 getNumEarly() const { return _numEarly; }
-    quint32 getNumLate() const { return _numLate; }
-    quint32 getNumLost() const { return _numLost; }
-    quint32 getNumRecovered() const { return _numRecovered; }
-    quint32 getNumDuplicate() const { return _numDuplicate; }
+    const PacketStreamStats& getStats() const { return _stats; }
+    PacketStreamStats getStatsForHistoryWindow() const;
     const QSet<quint16>& getMissingSet() const { return _missingSet; }
 
 private:
-    void pruneMissingSet(const bool wantExtraDebugging);
+    void receivedUnreasonable(quint16 incoming);
 
-    quint16 _lastReceived;
+private:
+    quint16 _lastReceivedSequence;
     QSet<quint16> _missingSet;
 
-    quint32 _numReceived;
-    quint32 _numUnreasonable;
-    quint32 _numEarly;
-    quint32 _numLate;
-    quint32 _numLost;
-    quint32 _numRecovered;
-    quint32 _numDuplicate;
+    PacketStreamStats _stats;
 
     QUuid _lastSenderUUID;
+
+    RingBufferHistory<PacketStreamStats> _statsHistory;
+
+    quint16 _lastUnreasonableSequence;
+    int _consecutiveUnreasonableOnTime;
 };
 
 #endif // hifi_SequenceNumberStats_h

@@ -18,6 +18,7 @@
 #include <Ragdoll.h>
 
 class Avatar;
+class MuscleConstraint;
 
 /// A skeleton loaded from a model.
 class SkeletonModel : public Model, public Ragdoll {
@@ -93,20 +94,25 @@ public:
     /// Retrieve the positions of up to two eye meshes.
     /// \return whether or not both eye meshes were found
     bool getEyePositions(glm::vec3& firstEyePosition, glm::vec3& secondEyePosition) const;
+
+    virtual void updateVisibleJointStates();
     
     // virtual overrride from Ragdoll
     virtual void stepRagdollForward(float deltaTime);
 
     void moveShapesTowardJoints(float fraction);
+    void updateMuscles();
 
     void computeBoundingShape(const FBXGeometry& geometry);
     void renderBoundingCollisionShapes(float alpha);
+    void renderJointCollisionShapes(float alpha);
     float getBoundingShapeRadius() const { return _boundingShape.getRadius(); }
     const CapsuleShape& getBoundingShape() const { return _boundingShape; }
 
-    void resetShapePositions(); // DEBUG method
+    void resetShapePositionsToDefaultPose(); // DEBUG method
 
     void renderRagdoll();
+    
 protected:
 
     // virtual overrrides from Ragdoll
@@ -141,6 +147,7 @@ private:
 
     CapsuleShape _boundingShape;
     glm::vec3 _boundingShapeLocalOffset;
+    QVector<MuscleConstraint*> _muscleConstraints;
 };
 
 #endif // hifi_SkeletonModel_h

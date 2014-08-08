@@ -9,12 +9,12 @@
 //  See the accompanying file LICENSE or http://www.apache.org/licenses/LICENSE-2.0.html
 //
 
-#include "UserActivityLogger.h"
-
 #include <QEventLoop>
 #include <QJsonDocument>
 #include <QHttpMultiPart>
 #include <QTimer>
+
+#include "UserActivityLogger.h"
 
 static const QString USER_ACTIVITY_URL = "/api/v1/user_activities";
 
@@ -23,10 +23,18 @@ UserActivityLogger& UserActivityLogger::getInstance() {
     return sharedInstance;
 }
 
-UserActivityLogger::UserActivityLogger() {
+UserActivityLogger::UserActivityLogger() : _disabled(false) {
+}
+
+void UserActivityLogger::disable(bool disable) {
+    _disabled = disable;
 }
 
 void UserActivityLogger::logAction(QString action, QJsonObject details, JSONCallbackParameters params) {
+    if (_disabled) {
+        return;
+    }
+    
     AccountManager& accountManager = AccountManager::getInstance();
     QHttpMultiPart* multipart = new QHttpMultiPart(QHttpMultiPart::FormDataType);
     
@@ -62,7 +70,7 @@ void UserActivityLogger::logAction(QString action, QJsonObject details, JSONCall
 }
 
 void UserActivityLogger::requestFinished(const QJsonObject& object) {
-    qDebug() << object;
+    // qDebug() << object;
 }
 
 void UserActivityLogger::requestError(QNetworkReply::NetworkError error,const QString& string) {
@@ -83,17 +91,10 @@ void UserActivityLogger::close(int delayTime) {
     
     // In order to get the end of the session, we need to give the account manager enough time to send the packet.
     QEventLoop loop;
-    // Here we connect the callbacks to stop the event loop
-    JSONCallbackParameters params;
-    params.jsonCallbackReceiver = &loop;
-    params.errorCallbackReceiver = &loop;
-    params.jsonCallbackMethod = "quit";
-    params.errorCallbackMethod = "quit";
-    // In case something goes wrong, we also setup a timer so that the delai is not greater than delayTime
     QTimer timer;
     connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
     // Now we can log it
-    logAction(ACTION_NAME, QJsonObject(), params);
+    logAction(ACTION_NAME, QJsonObject());
     timer.start(delayTime);
     loop.exec();
 }
@@ -152,4 +153,16 @@ void UserActivityLogger::loadedScript(QString scriptName) {
     
     logAction(ACTION_NAME, actionDetails);
 
+}
+
+void UserActivityLogger::wentTo(QString destinationType, QString destinationName) {
+    const QString ACTION_NAME = "went_to";
+    QJsonObject actionDetails;
+    const QString DESTINATION_TYPE_KEY = "destination_type";
+    const QString DESTINATION_NAME_KEY = "detination_name";
+    
+    actionDetails.insert(DESTINATION_TYPE_KEY, destinationType);
+    actionDetails.insert(DESTINATION_NAME_KEY, destinationName);
+    
+    logAction(ACTION_NAME, actionDetails);
 }

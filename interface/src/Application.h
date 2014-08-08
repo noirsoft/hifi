@@ -63,6 +63,8 @@
 #include "devices/PrioVR.h"
 #include "devices/SixenseManager.h"
 #include "devices/Visage.h"
+#include "devices/CaraFaceTracker.h"
+#include "devices/DdeFaceTracker.h"
 #include "models/ModelTreeRenderer.h"
 #include "particles/ParticleTreeRenderer.h"
 #include "renderer/AmbientOcclusionEffect.h"
@@ -97,7 +99,6 @@ class QActionGroup;
 class QGLWidget;
 class QKeyEvent;
 class QMouseEvent;
-class QNetworkAccessManager;
 class QSettings;
 class QWheelEvent;
 
@@ -125,6 +126,8 @@ static const float MIRROR_FULLSCREEN_DISTANCE = 0.35f;
 static const float MIRROR_REARVIEW_DISTANCE = 0.65f;
 static const float MIRROR_REARVIEW_BODY_DISTANCE = 2.3f;
 static const float MIRROR_FIELD_OF_VIEW = 30.0f;
+
+static const quint64 TOO_LONG_SINCE_LAST_SEND_DOWNSTREAM_AUDIO_STATS = 1 * USECS_PER_SECOND;
 
 class Application : public QApplication {
     Q_OBJECT
@@ -158,9 +161,9 @@ public:
     void focusOutEvent(QFocusEvent* event);
     void focusInEvent(QFocusEvent* event);
 
-    void mouseMoveEvent(QMouseEvent* event);
-    void mousePressEvent(QMouseEvent* event);
-    void mouseReleaseEvent(QMouseEvent* event);
+    void mouseMoveEvent(QMouseEvent* event, unsigned int deviceID = 0);
+    void mousePressEvent(QMouseEvent* event, unsigned int deviceID = 0);
+    void mouseReleaseEvent(QMouseEvent* event, unsigned int deviceID = 0);
 
     void touchBeginEvent(QTouchEvent* event);
     void touchEndEvent(QTouchEvent* event);
@@ -199,6 +202,8 @@ public:
     bool getImportSucceded() { return _importSucceded; }
     VoxelSystem* getSharedVoxelSystem() { return &_sharedVoxelSystem; }
     VoxelTree* getClipboard() { return &_clipboard; }
+    ModelTree* getModelClipboard() { return &_modelClipboard; }
+    ModelTreeRenderer* getModelClipboardRenderer() { return &_modelClipboardRenderer; }
     Environment* getEnvironment() { return &_environment; }
     bool isMousePressed() const { return _mousePressed; }
     bool isMouseHidden() const { return _mouseHidden; }
@@ -206,10 +211,12 @@ public:
     const glm::vec3& getMouseRayDirection() const { return _mouseRayDirection; }
     int getMouseX() const { return _mouseX; }
     int getMouseY() const { return _mouseY; }
-    unsigned int getLastMouseMoveType() const { return _lastMouseMoveType; }
+    bool getLastMouseMoveWasSimulated() const { return _lastMouseMoveWasSimulated;; }
     Faceplus* getFaceplus() { return &_faceplus; }
     Faceshift* getFaceshift() { return &_faceshift; }
     Visage* getVisage() { return &_visage; }
+    DdeFaceTracker* getDDE() { return &_dde; }
+    CaraFaceTracker* getCara() { return &_cara; }
     FaceTracker* getActiveFaceTracker();
     SixenseManager* getSixenseManager() { return &_sixenseManager; }
     PrioVR* getPrioVR() { return &_prioVR; }
@@ -224,6 +231,7 @@ public:
     float getPacketsPerSecond() const { return _packetsPerSecond; }
     float getBytesPerSecond() const { return _bytesPerSecond; }
     const glm::vec3& getViewMatrixTranslation() const { return _viewMatrixTranslation; }
+    void setViewMatrixTranslation(const glm::vec3& translation) { _viewMatrixTranslation = translation; }
 
     /// if you need to access the application settings, use lockSettings()/unlockSettings()
     QSettings* lockSettings() { _settingsMutex.lock(); return _settings; }
@@ -236,7 +244,6 @@ public:
     void lockOctreeSceneStats() { _octreeSceneStatsLock.lockForRead(); }
     void unlockOctreeSceneStats() { _octreeSceneStatsLock.unlock(); }
 
-    QNetworkAccessManager* getNetworkAccessManager() { return _networkAccessManager; }
     GeometryCache* getGeometryCache() { return &_geometryCache; }
     AnimationCache* getAnimationCache() { return &_animationCache; }
     TextureCache* getTextureCache() { return &_textureCache; }
@@ -257,6 +264,8 @@ public:
     /// Stores the current modelview matrix as the untranslated view matrix to use for transforms and the supplied vector as
     /// the view matrix translation.
     void updateUntranslatedViewMatrix(const glm::vec3& viewMatrixTranslation = glm::vec3());
+
+    const glm::mat4& getUntranslatedViewMatrix() const { return _untranslatedViewMatrix; }
 
     /// Loads a view matrix that incorporates the specified model translation without the precision issues that can
     /// result from matrix multiplication at high translation magnitudes.
@@ -310,6 +319,10 @@ public slots:
     void nodeKilled(SharedNodePointer node);
     void packetSent(quint64 length);
 
+    void pasteModels(float x, float y, float z);
+    bool exportModels(const QString& filename, float x, float y, float z, float scale);
+    bool importModels(const QString& filename);
+
     void importVoxels(); // doesn't include source voxel because it goes to clipboard
     void cutVoxels(const VoxelDetail& sourceVoxel);
     void copyVoxels(const VoxelDetail& sourceVoxel);
@@ -319,6 +332,7 @@ public slots:
     void nudgeVoxelsByVector(const VoxelDetail& sourceVoxel, const glm::vec3& nudgeVec);
 
     void setRenderVoxels(bool renderVoxels);
+    void setLowVelocityFilter(bool lowVelocityFilter);
     void doKillLocalVoxels();
     void loadDialog();
     void loadScriptURLDialog();
@@ -337,6 +351,8 @@ public slots:
     void uploadAttachment();
 
     void bumpSettings() { ++_numChangedSettings; }
+    
+    void domainSettingsReceived(const QJsonObject& domainSettingsObject);
 
 private slots:
     void timer();
@@ -379,6 +395,8 @@ private:
     void updateFaceplus();
     void updateFaceshift();
     void updateVisage();
+    void updateDDE();
+    void updateCara();
     void updateMyAvatarLookAtPosition();
     void updateThreads(float deltaTime);
     void updateMetavoxels(float deltaTime);
@@ -423,7 +441,6 @@ private:
     QThread* _nodeThread;
     DatagramProcessor _datagramProcessor;
 
-    QNetworkAccessManager* _networkAccessManager;
     QMutex _settingsMutex;
     QSettings* _settings;
     int _numChangedSettings;
@@ -455,6 +472,8 @@ private:
     ParticleCollisionSystem _particleCollisionSystem;
 
     ModelTreeRenderer _models;
+    ModelTreeRenderer _modelClipboardRenderer;
+    ModelTree _modelClipboard;
 
     QByteArray _voxelsFilename;
     bool _wantToKillLocalVoxels;
@@ -476,6 +495,8 @@ private:
     Faceplus _faceplus;
     Faceshift _faceshift;
     Visage _visage;
+    CaraFaceTracker _cara;
+    DdeFaceTracker _dde;
 
     SixenseManager _sixenseManager;
     PrioVR _prioVR;
@@ -507,7 +528,7 @@ private:
     int _mouseDragStartedX;
     int _mouseDragStartedY;
     quint64 _lastMouseMove;
-    unsigned int _lastMouseMoveType;
+    bool _lastMouseMoveWasSimulated;
     bool _mouseHidden;
     bool _seenMouseMove;
 
@@ -588,6 +609,7 @@ private:
     QSystemTrayIcon* _trayIcon;
 
     quint64 _lastNackTime;
+    quint64 _lastSendDownstreamAudioStats;
 };
 
 #endif // hifi_Application_h

@@ -19,15 +19,13 @@
 #include "AudioRingBuffer.h"
 
 
-AudioRingBuffer::AudioRingBuffer(int numFrameSamples, bool randomAccessMode) :
-    NodeData(),
-    _overflowCount(0),
-    _sampleCapacity(numFrameSamples * RING_BUFFER_LENGTH_FRAMES),
+AudioRingBuffer::AudioRingBuffer(int numFrameSamples, bool randomAccessMode, int numFramesCapacity) :
+    _frameCapacity(numFramesCapacity),
+    _sampleCapacity(numFrameSamples * numFramesCapacity),
     _isFull(false),
     _numFrameSamples(numFrameSamples),
-    _isStarved(true),
-    _hasStarted(false),
-    _randomAccessMode(randomAccessMode)
+    _randomAccessMode(randomAccessMode),
+    _overflowCount(0)
 {
     if (numFrameSamples) {
         _buffer = new int16_t[_sampleCapacity];
@@ -48,26 +46,25 @@ AudioRingBuffer::~AudioRingBuffer() {
 }
 
 void AudioRingBuffer::reset() {
-    _endOfLastWrite = _buffer;
-    _nextOutput = _buffer;
-    _isStarved = true;
+    clear();
+    _overflowCount = 0;
 }
 
 void AudioRingBuffer::resizeForFrameSize(int numFrameSamples) {
     delete[] _buffer;
-    _sampleCapacity = numFrameSamples * RING_BUFFER_LENGTH_FRAMES;
+    _sampleCapacity = numFrameSamples * _frameCapacity;
+    _numFrameSamples = numFrameSamples;
     _buffer = new int16_t[_sampleCapacity];
     if (_randomAccessMode) {
         memset(_buffer, 0, _sampleCapacity * sizeof(int16_t));
     }
-    _nextOutput = _buffer;
-    _endOfLastWrite = _buffer;
+    reset();
 }
 
-int AudioRingBuffer::parseData(const QByteArray& packet) {
-    // skip packet header and sequence number
-    int numBytesBeforeAudioData = numBytesForPacketHeader(packet) + sizeof(quint16);
-    return writeData(packet.data() + numBytesBeforeAudioData, packet.size() - numBytesBeforeAudioData);
+void AudioRingBuffer::clear() {
+    _isFull = false;
+    _endOfLastWrite = _buffer;
+    _nextOutput = _buffer;
 }
 
 int AudioRingBuffer::readSamples(int16_t* destination, int maxSamples) {
@@ -208,14 +205,6 @@ int AudioRingBuffer::addSilentFrame(int numSilentSamples) {
     return numSilentSamples * sizeof(int16_t);
 }
 
-bool AudioRingBuffer::isNotStarvedOrHasMinimumSamples(int numRequiredSamples) const {
-    if (!_isStarved) {
-        return true;
-    } else {
-        return samplesAvailable() >= numRequiredSamples;
-    }
-}
-
 int16_t* AudioRingBuffer::shiftedPositionAccomodatingWrap(int16_t* position, int numSamplesShift) const {
 
     if (numSamplesShift > 0 && position + numSamplesShift >= _buffer + _sampleCapacity) {
@@ -228,3 +217,27 @@ int16_t* AudioRingBuffer::shiftedPositionAccomodatingWrap(int16_t* position, int
         return position + numSamplesShift;
     }
 }
+
+float AudioRingBuffer::getFrameLoudness(const int16_t* frameStart) const {
+    float loudness = 0.0f;
+    const int16_t* sampleAt = frameStart;
+    const int16_t* _bufferLastAt = _buffer + _sampleCapacity - 1;
+
+    for (int i = 0; i < _numFrameSamples; ++i) {
+        loudness += fabsf(*sampleAt);
+        sampleAt = sampleAt == _bufferLastAt ? _buffer : sampleAt + 1;
+    }
+    loudness /= _numFrameSamples;
+    loudness /= MAX_SAMPLE_VALUE;
+    
+    return loudness;
+}
+
+float AudioRingBuffer::getFrameLoudness(ConstIterator frameStart) const {
+    return getFrameLoudness(&(*frameStart));
+}
+
+float AudioRingBuffer::getNextOutputFrameLoudness() const {
+    return getFrameLoudness(_nextOutput);
+}
+

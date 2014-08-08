@@ -11,6 +11,7 @@
 
 #include <QMetaType>
 #include <QRunnable>
+#include <QScriptEngine>
 #include <QThreadPool>
 
 #include <glm/gtx/transform.hpp>
@@ -19,6 +20,7 @@
 #include <CapsuleShape.h>
 #include <GeometryUtil.h>
 #include <PhysicsEntity.h>
+#include <RegisteredMetaTypes.h>
 #include <ShapeCollider.h>
 #include <SphereShape.h>
 
@@ -31,6 +33,23 @@ static int modelPointerTypeId = qRegisterMetaType<QPointer<Model> >();
 static int weakNetworkGeometryPointerTypeId = qRegisterMetaType<QWeakPointer<NetworkGeometry> >();
 static int vec3VectorTypeId = qRegisterMetaType<QVector<glm::vec3> >();
 
+static QScriptValue localLightToScriptValue(QScriptEngine* engine, const Model::LocalLight& light) {
+    QScriptValue object = engine->newObject();
+    object.setProperty("direction", vec3toScriptValue(engine, light.direction));
+    object.setProperty("color", vec3toScriptValue(engine, light.color));
+    return object;
+}
+
+static void localLightFromScriptValue(const QScriptValue& value, Model::LocalLight& light) {
+    vec3FromScriptValue(value.property("direction"), light.direction);
+    vec3FromScriptValue(value.property("color"), light.color);
+}
+
+void Model::registerMetaTypes(QScriptEngine* engine) {
+    qScriptRegisterMetaType(engine, localLightToScriptValue, localLightFromScriptValue);
+    qScriptRegisterSequenceMetaType<QVector<Model::LocalLight> >(engine);
+}
+
 Model::Model(QObject* parent) :
     QObject(parent),
     _scale(1.0f, 1.0f, 1.0f),
@@ -39,8 +58,7 @@ Model::Model(QObject* parent) :
     _scaledToFit(false),
     _snapModelToCenter(false),
     _snappedToCenter(false),
-    _rootIndex(-1),
-    //_enableCollisionShapes(false),
+    _showTrueJointTransforms(true),
     _lodDistance(0.0f),
     _pupilDilation(0.0f),
     _url("http://invalid.com") {
@@ -86,17 +104,18 @@ ProgramObject Model::_skinCascadedShadowNormalSpecularMapProgram;
 
 ProgramObject Model::_skinShadowProgram;
 
-int Model::_normalMapTangentLocation;
-int Model::_normalSpecularMapTangentLocation;
-int Model::_shadowNormalMapTangentLocation;
-int Model::_shadowNormalSpecularMapTangentLocation;
-int Model::_cascadedShadowNormalMapTangentLocation;
-int Model::_cascadedShadowNormalSpecularMapTangentLocation;
-
-int Model::_cascadedShadowMapDistancesLocation;
-int Model::_cascadedShadowNormalMapDistancesLocation;
-int Model::_cascadedShadowSpecularMapDistancesLocation;
-int Model::_cascadedShadowNormalSpecularMapDistancesLocation;
+Model::Locations Model::_locations;
+Model::Locations Model::_normalMapLocations;
+Model::Locations Model::_specularMapLocations;
+Model::Locations Model::_normalSpecularMapLocations;
+Model::Locations Model::_shadowMapLocations;
+Model::Locations Model::_shadowNormalMapLocations;
+Model::Locations Model::_shadowSpecularMapLocations;
+Model::Locations Model::_shadowNormalSpecularMapLocations;
+Model::Locations Model::_cascadedShadowMapLocations;
+Model::Locations Model::_cascadedShadowNormalMapLocations;
+Model::Locations Model::_cascadedShadowSpecularMapLocations;
+Model::Locations Model::_cascadedShadowNormalSpecularMapLocations;
     
 Model::SkinLocations Model::_skinLocations;
 Model::SkinLocations Model::_skinNormalMapLocations;
@@ -126,6 +145,7 @@ void Model::setScaleInternal(const glm::vec3& scale) {
     const float ONE_PERCENT = 0.01f;
     if (relativeDeltaScale > ONE_PERCENT || scaleLength < EPSILON) {
         _scale = scale;
+        initJointTransforms();
         if (_shapes.size() > 0) {
             clearShapes();
             buildShapes();
@@ -141,15 +161,13 @@ void Model::setOffset(const glm::vec3& offset) {
     _snappedToCenter = false; 
 }
 
-
-void Model::initSkinProgram(ProgramObject& program, Model::SkinLocations& locations,
+void Model::initProgram(ProgramObject& program, Model::Locations& locations,
         int specularTextureUnit, int shadowTextureUnit) {
     program.bind();
-    locations.clusterMatrices = program.uniformLocation("clusterMatrices");
-    locations.clusterIndices = program.attributeLocation("clusterIndices");
-    locations.clusterWeights = program.attributeLocation("clusterWeights");
     locations.tangent = program.attributeLocation("tangent");
     locations.shadowDistances = program.uniformLocation("shadowDistances");
+    locations.localLightColors = program.uniformLocation("localLightColors");
+    locations.localLightDirections = program.uniformLocation("localLightDirections");
     program.setUniformValue("diffuseMap", 0);
     program.setUniformValue("normalMap", 1);
     program.setUniformValue("specularMap", specularTextureUnit);
@@ -157,32 +175,47 @@ void Model::initSkinProgram(ProgramObject& program, Model::SkinLocations& locati
     program.release();
 }
 
+void Model::initSkinProgram(ProgramObject& program, Model::SkinLocations& locations,
+        int specularTextureUnit, int shadowTextureUnit) {
+    initProgram(program, locations, specularTextureUnit, shadowTextureUnit);
+    
+    program.bind();
+    locations.clusterMatrices = program.uniformLocation("clusterMatrices");
+    locations.clusterIndices = program.attributeLocation("clusterIndices");
+    locations.clusterWeights = program.attributeLocation("clusterWeights");
+    program.release();
+}
+
 QVector<JointState> Model::createJointStates(const FBXGeometry& geometry) {
     QVector<JointState> jointStates;
-    foreach (const FBXJoint& joint, geometry.joints) {
-        // NOTE: the state keeps a pointer to an FBXJoint
+    for (int i = 0; i < geometry.joints.size(); ++i) {
+        const FBXJoint& joint = geometry.joints[i];
+        // store a pointer to the FBXJoint in the JointState
         JointState state;
         state.setFBXJoint(&joint);
+
         jointStates.append(state);
     }
+    return jointStates;
+};
 
+void Model::initJointTransforms() {
     // compute model transforms
-    int numJoints = jointStates.size();
-    for (int i = 0; i < numJoints; ++i) {
-        JointState& state = jointStates[i];
+    int numStates = _jointStates.size();
+    for (int i = 0; i < numStates; ++i) {
+        JointState& state = _jointStates[i];
         const FBXJoint& joint = state.getFBXJoint();
         int parentIndex = joint.parentIndex;
         if (parentIndex == -1) {
-            _rootIndex = i;
+            const FBXGeometry& geometry = _geometry->getFBXGeometry();
             // NOTE: in practice geometry.offset has a non-unity scale (rather than a translation)
             glm::mat4 parentTransform = glm::scale(_scale) * glm::translate(_offset) * geometry.offset;
-            state.computeTransform(parentTransform);
+            state.initTransform(parentTransform);
         } else {
-            const JointState& parentState = jointStates.at(parentIndex);
-            state.computeTransform(parentState.getTransform());
+            const JointState& parentState = _jointStates.at(parentIndex);
+            state.initTransform(parentState.getTransform());
         }
     }
-    return jointStates;
 }
 
 void Model::init() {
@@ -191,9 +224,7 @@ void Model::init() {
         _program.addShaderFromSourceFile(QGLShader::Fragment, Application::resourcesPath() + "shaders/model.frag");
         _program.link();
         
-        _program.bind();
-        _program.setUniformValue("diffuseMap", 0);
-        _program.release();
+        initProgram(_program, _locations);
         
         _normalMapProgram.addShaderFromSourceFile(QGLShader::Vertex,
             Application::resourcesPath() + "shaders/model_normal_map.vert");
@@ -201,11 +232,7 @@ void Model::init() {
             Application::resourcesPath() + "shaders/model_normal_map.frag");
         _normalMapProgram.link();
         
-        _normalMapProgram.bind();
-        _normalMapProgram.setUniformValue("diffuseMap", 0);
-        _normalMapProgram.setUniformValue("normalMap", 1);
-        _normalMapTangentLocation = _normalMapProgram.attributeLocation("tangent");
-        _normalMapProgram.release();
+        initProgram(_normalMapProgram, _normalMapLocations);
         
         _specularMapProgram.addShaderFromSourceFile(QGLShader::Vertex,
             Application::resourcesPath() + "shaders/model.vert");
@@ -213,10 +240,7 @@ void Model::init() {
             Application::resourcesPath() + "shaders/model_specular_map.frag");
         _specularMapProgram.link();
         
-        _specularMapProgram.bind();
-        _specularMapProgram.setUniformValue("diffuseMap", 0);
-        _specularMapProgram.setUniformValue("specularMap", 1);
-        _specularMapProgram.release();
+        initProgram(_specularMapProgram, _specularMapLocations);
         
         _normalSpecularMapProgram.addShaderFromSourceFile(QGLShader::Vertex,
             Application::resourcesPath() + "shaders/model_normal_map.vert");
@@ -224,12 +248,7 @@ void Model::init() {
             Application::resourcesPath() + "shaders/model_normal_specular_map.frag");
         _normalSpecularMapProgram.link();
         
-        _normalSpecularMapProgram.bind();
-        _normalSpecularMapProgram.setUniformValue("diffuseMap", 0);
-        _normalSpecularMapProgram.setUniformValue("normalMap", 1);
-        _normalSpecularMapProgram.setUniformValue("specularMap", 2);
-        _normalSpecularMapTangentLocation = _normalSpecularMapProgram.attributeLocation("tangent");
-        _normalSpecularMapProgram.release();
+        initProgram(_normalSpecularMapProgram, _normalSpecularMapLocations, 2);
         
         
         _shadowMapProgram.addShaderFromSourceFile(QGLShader::Vertex, Application::resourcesPath() + "shaders/model.vert");
@@ -237,10 +256,7 @@ void Model::init() {
             "shaders/model_shadow_map.frag");
         _shadowMapProgram.link();
         
-        _shadowMapProgram.bind();
-        _shadowMapProgram.setUniformValue("diffuseMap", 0);
-        _shadowMapProgram.setUniformValue("shadowMap", 1);
-        _shadowMapProgram.release();
+        initProgram(_shadowMapProgram, _shadowMapLocations);
         
         _shadowNormalMapProgram.addShaderFromSourceFile(QGLShader::Vertex,
             Application::resourcesPath() + "shaders/model_normal_map.vert");
@@ -248,12 +264,7 @@ void Model::init() {
             Application::resourcesPath() + "shaders/model_shadow_normal_map.frag");
         _shadowNormalMapProgram.link();
         
-        _shadowNormalMapProgram.bind();
-        _shadowNormalMapProgram.setUniformValue("diffuseMap", 0);
-        _shadowNormalMapProgram.setUniformValue("normalMap", 1);
-        _shadowNormalMapProgram.setUniformValue("shadowMap", 2);
-        _shadowNormalMapTangentLocation = _shadowNormalMapProgram.attributeLocation("tangent");
-        _shadowNormalMapProgram.release();
+        initProgram(_shadowNormalMapProgram, _shadowNormalMapLocations, 1, 2);
         
         _shadowSpecularMapProgram.addShaderFromSourceFile(QGLShader::Vertex,
             Application::resourcesPath() + "shaders/model.vert");
@@ -261,11 +272,7 @@ void Model::init() {
             Application::resourcesPath() + "shaders/model_shadow_specular_map.frag");
         _shadowSpecularMapProgram.link();
         
-        _shadowSpecularMapProgram.bind();
-        _shadowSpecularMapProgram.setUniformValue("diffuseMap", 0);
-        _shadowSpecularMapProgram.setUniformValue("specularMap", 1);
-         _shadowSpecularMapProgram.setUniformValue("shadowMap", 2);
-        _shadowSpecularMapProgram.release();
+        initProgram(_shadowSpecularMapProgram, _shadowSpecularMapLocations, 1, 2);
         
         _shadowNormalSpecularMapProgram.addShaderFromSourceFile(QGLShader::Vertex,
             Application::resourcesPath() + "shaders/model_normal_map.vert");
@@ -273,13 +280,7 @@ void Model::init() {
             Application::resourcesPath() + "shaders/model_shadow_normal_specular_map.frag");
         _shadowNormalSpecularMapProgram.link();
         
-        _shadowNormalSpecularMapProgram.bind();
-        _shadowNormalSpecularMapProgram.setUniformValue("diffuseMap", 0);
-        _shadowNormalSpecularMapProgram.setUniformValue("normalMap", 1);
-        _shadowNormalSpecularMapProgram.setUniformValue("specularMap", 2);
-        _shadowNormalSpecularMapProgram.setUniformValue("shadowMap", 3);
-        _shadowNormalSpecularMapTangentLocation = _shadowNormalSpecularMapProgram.attributeLocation("tangent");
-        _shadowNormalSpecularMapProgram.release();
+        initProgram(_shadowNormalSpecularMapProgram, _shadowNormalSpecularMapLocations, 2, 3);
         
         
         _cascadedShadowMapProgram.addShaderFromSourceFile(QGLShader::Vertex, Application::resourcesPath() +
@@ -288,11 +289,7 @@ void Model::init() {
             "shaders/model_cascaded_shadow_map.frag");
         _cascadedShadowMapProgram.link();
         
-        _cascadedShadowMapProgram.bind();
-        _cascadedShadowMapProgram.setUniformValue("diffuseMap", 0);
-        _cascadedShadowMapProgram.setUniformValue("shadowMap", 1);
-        _cascadedShadowMapDistancesLocation = _cascadedShadowMapProgram.uniformLocation("shadowDistances");
-        _cascadedShadowMapProgram.release();
+        initProgram(_cascadedShadowMapProgram, _cascadedShadowMapLocations);
         
         _cascadedShadowNormalMapProgram.addShaderFromSourceFile(QGLShader::Vertex,
             Application::resourcesPath() + "shaders/model_normal_map.vert");
@@ -300,13 +297,7 @@ void Model::init() {
             Application::resourcesPath() + "shaders/model_cascaded_shadow_normal_map.frag");
         _cascadedShadowNormalMapProgram.link();
         
-        _cascadedShadowNormalMapProgram.bind();
-        _cascadedShadowNormalMapProgram.setUniformValue("diffuseMap", 0);
-        _cascadedShadowNormalMapProgram.setUniformValue("normalMap", 1);
-        _cascadedShadowNormalMapProgram.setUniformValue("shadowMap", 2);
-        _cascadedShadowNormalMapDistancesLocation = _cascadedShadowNormalMapProgram.uniformLocation("shadowDistances");
-        _cascadedShadowNormalMapTangentLocation = _cascadedShadowNormalMapProgram.attributeLocation("tangent");
-        _cascadedShadowNormalMapProgram.release();
+        initProgram(_cascadedShadowNormalMapProgram, _cascadedShadowNormalMapLocations, 1, 2);
         
         _cascadedShadowSpecularMapProgram.addShaderFromSourceFile(QGLShader::Vertex,
             Application::resourcesPath() + "shaders/model.vert");
@@ -314,12 +305,7 @@ void Model::init() {
             Application::resourcesPath() + "shaders/model_cascaded_shadow_specular_map.frag");
         _cascadedShadowSpecularMapProgram.link();
         
-        _cascadedShadowSpecularMapProgram.bind();
-        _cascadedShadowSpecularMapProgram.setUniformValue("diffuseMap", 0);
-        _cascadedShadowSpecularMapProgram.setUniformValue("specularMap", 1);
-        _cascadedShadowSpecularMapProgram.setUniformValue("shadowMap", 2);
-        _cascadedShadowSpecularMapDistancesLocation = _cascadedShadowSpecularMapProgram.uniformLocation("shadowDistances");
-        _cascadedShadowSpecularMapProgram.release();
+        initProgram(_cascadedShadowSpecularMapProgram, _cascadedShadowSpecularMapLocations, 1, 2);
         
         _cascadedShadowNormalSpecularMapProgram.addShaderFromSourceFile(QGLShader::Vertex,
             Application::resourcesPath() + "shaders/model_normal_map.vert");
@@ -327,15 +313,7 @@ void Model::init() {
             Application::resourcesPath() + "shaders/model_cascaded_shadow_normal_specular_map.frag");
         _cascadedShadowNormalSpecularMapProgram.link();
         
-        _cascadedShadowNormalSpecularMapProgram.bind();
-        _cascadedShadowNormalSpecularMapProgram.setUniformValue("diffuseMap", 0);
-        _cascadedShadowNormalSpecularMapProgram.setUniformValue("normalMap", 1);
-        _cascadedShadowNormalSpecularMapProgram.setUniformValue("specularMap", 2);
-        _cascadedShadowNormalSpecularMapProgram.setUniformValue("shadowMap", 3);
-        _cascadedShadowNormalSpecularMapDistancesLocation =
-            _cascadedShadowNormalSpecularMapProgram.uniformLocation("shadowDistances");
-        _cascadedShadowNormalSpecularMapTangentLocation = _cascadedShadowNormalSpecularMapProgram.attributeLocation("tangent");
-        _cascadedShadowNormalSpecularMapProgram.release();
+        initProgram(_cascadedShadowNormalSpecularMapProgram, _cascadedShadowNormalSpecularMapLocations, 2, 3);
         
         
         _shadowProgram.addShaderFromSourceFile(QGLShader::Vertex, Application::resourcesPath() + "shaders/model_shadow.vert");
@@ -460,7 +438,7 @@ void Model::reset() {
     }
     const FBXGeometry& geometry = _geometry->getFBXGeometry();
     for (int i = 0; i < _jointStates.size(); i++) {
-        _jointStates[i]._rotationInParentFrame = geometry.joints.at(i).rotation;
+        _jointStates[i].setRotationInConstrainedFrame(geometry.joints.at(i).rotation);
     }
 }
 
@@ -560,16 +538,19 @@ bool Model::updateGeometry() {
 // virtual
 void Model::setJointStates(QVector<JointState> states) {
     _jointStates = states;
+    initJointTransforms();
 
-    // compute an approximate bounding radius for broadphase collision queries
-    // against PhysicsSimulation boundaries
-    int numJoints = _jointStates.size();
+    int numStates = _jointStates.size();
     float radius = 0.0f;
-    for (int i = 0; i < numJoints; ++i) {
+    for (int i = 0; i < numStates; ++i) {
         float distance = glm::length(_jointStates[i].getPosition());
         if (distance > radius) {
             radius = distance;
         }
+        _jointStates[i].updateConstraint();
+    }
+    for (int i = 0; i < _jointStates.size(); i++) {
+        _jointStates[i].slaveVisibleTransform();
     }
     _boundingRadius = radius;
 }
@@ -604,6 +585,17 @@ bool Model::render(float alpha, RenderMode mode, bool receiveShadows) {
         glEnable(GL_CULL_FACE);
         if (mode == SHADOW_RENDER_MODE) {
             glCullFace(GL_FRONT);
+        
+        } else if (mode == DEFAULT_RENDER_MODE) {
+            // update the local lights
+            for (int i = 0; i < MAX_LOCAL_LIGHTS; i++) {
+                if (i < _localLights.size()) {
+                    _localLightDirections[i] = glm::normalize(Application::getInstance()->getUntranslatedViewMatrix() *
+                        glm::vec4(_rotation * _localLights.at(i).direction, 0.0f));
+                } else {
+                    _localLightColors[i] = glm::vec4();
+                }
+            }
         }
     }
     
@@ -686,12 +678,18 @@ bool Model::getJointState(int index, glm::quat& rotation) const {
     if (index == -1 || index >= _jointStates.size()) {
         return false;
     }
-    rotation = _jointStates.at(index)._rotationInParentFrame;
-    const glm::quat& defaultRotation = _geometry->getFBXGeometry().joints.at(index).rotation;
-    return glm::abs(rotation.x - defaultRotation.x) >= EPSILON ||
-        glm::abs(rotation.y - defaultRotation.y) >= EPSILON ||
-        glm::abs(rotation.z - defaultRotation.z) >= EPSILON ||
-        glm::abs(rotation.w - defaultRotation.w) >= EPSILON;
+    const JointState& state = _jointStates.at(index);
+    rotation = state.getRotationInConstrainedFrame();
+    return !state.rotationIsDefault(rotation);
+}
+
+bool Model::getVisibleJointState(int index, glm::quat& rotation) const {
+    if (index == -1 || index >= _jointStates.size()) {
+        return false;
+    }
+    const JointState& state = _jointStates.at(index);
+    rotation = state.getVisibleRotationInConstrainedFrame();
+    return !state.rotationIsDefault(rotation);
 }
 
 void Model::setJointState(int index, bool valid, const glm::quat& rotation, float priority) {
@@ -699,7 +697,7 @@ void Model::setJointState(int index, bool valid, const glm::quat& rotation, floa
         JointState& state = _jointStates[index];
         if (priority >= state._animationPriority) {
             if (valid) {
-                state._rotationInParentFrame = rotation;
+                state.setRotationInConstrainedFrame(rotation);
                 state._animationPriority = priority;
             } else {
                 state.restoreRotation(1.0f, priority);
@@ -762,6 +760,23 @@ bool Model::getJointCombinedRotation(int jointIndex, glm::quat& rotation) const 
         return false;
     }
     rotation = _rotation * _jointStates[jointIndex].getRotation();
+    return true;
+}
+
+bool Model::getVisibleJointPositionInWorldFrame(int jointIndex, glm::vec3& position) const {
+    if (jointIndex == -1 || jointIndex >= _jointStates.size()) {
+        return false;
+    }
+    // position is in world-frame
+    position = _translation + _rotation * _jointStates[jointIndex].getVisiblePosition();
+    return true;
+}
+
+bool Model::getVisibleJointRotationInWorldFrame(int jointIndex, glm::quat& rotation) const {
+    if (jointIndex == -1 || jointIndex >= _jointStates.size()) {
+        return false;
+    }
+    rotation = _rotation * _jointStates[jointIndex].getVisibleRotation();
     return true;
 }
 
@@ -909,7 +924,7 @@ void Model::simulate(float deltaTime, bool fullUpdate) {
 void Model::simulateInternal(float deltaTime) {
     // NOTE: this is a recursive call that walks all attachments, and their attachments
     // update the world space transforms for all joints
-
+    
     // update animations
     foreach (const AnimationHandlePointer& handle, _runningAnimations) {
         handle->simulate(deltaTime);
@@ -918,7 +933,11 @@ void Model::simulateInternal(float deltaTime) {
     for (int i = 0; i < _jointStates.size(); i++) {
         updateJointState(i);
     }
-    _shapesAreDirty = ! _shapes.isEmpty();
+    for (int i = 0; i < _jointStates.size(); i++) {
+        _jointStates[i].resetTransformChanged();
+    }
+
+    _shapesAreDirty = !_shapes.isEmpty();
     
     // update the attachment transforms and simulate them
     const FBXGeometry& geometry = _geometry->getFBXGeometry();
@@ -928,8 +947,13 @@ void Model::simulateInternal(float deltaTime) {
         
         glm::vec3 jointTranslation = _translation;
         glm::quat jointRotation = _rotation;
-        getJointPositionInWorldFrame(attachment.jointIndex, jointTranslation);
-        getJointRotationInWorldFrame(attachment.jointIndex, jointRotation);
+        if (_showTrueJointTransforms) {
+            getJointPositionInWorldFrame(attachment.jointIndex, jointTranslation);
+            getJointRotationInWorldFrame(attachment.jointIndex, jointRotation);
+        } else {
+            getVisibleJointPositionInWorldFrame(attachment.jointIndex, jointTranslation);
+            getVisibleJointRotationInWorldFrame(attachment.jointIndex, jointRotation);
+        }
         
         model->setTranslation(jointTranslation + jointRotation * attachment.translation * _scale);
         model->setRotation(jointRotation * attachment.rotation);
@@ -944,9 +968,16 @@ void Model::simulateInternal(float deltaTime) {
     for (int i = 0; i < _meshStates.size(); i++) {
         MeshState& state = _meshStates[i];
         const FBXMesh& mesh = geometry.meshes.at(i);
-        for (int j = 0; j < mesh.clusters.size(); j++) {
-            const FBXCluster& cluster = mesh.clusters.at(j);
-            state.clusterMatrices[j] = modelToWorld * _jointStates[cluster.jointIndex].getTransform() * cluster.inverseBindMatrix;
+        if (_showTrueJointTransforms) {
+            for (int j = 0; j < mesh.clusters.size(); j++) {
+                const FBXCluster& cluster = mesh.clusters.at(j);
+                state.clusterMatrices[j] = modelToWorld * _jointStates[cluster.jointIndex].getTransform() * cluster.inverseBindMatrix;
+            }
+        } else {
+            for (int j = 0; j < mesh.clusters.size(); j++) {
+                const FBXCluster& cluster = mesh.clusters.at(j);
+                state.clusterMatrices[j] = modelToWorld * _jointStates[cluster.jointIndex].getVisibleTransform() * cluster.inverseBindMatrix;
+            }
         }
     }
     
@@ -968,7 +999,17 @@ void Model::updateJointState(int index) {
         state.computeTransform(parentTransform);
     } else {
         const JointState& parentState = _jointStates.at(parentIndex);
-        state.computeTransform(parentState.getTransform());
+        state.computeTransform(parentState.getTransform(), parentState.getTransformChanged());
+    }
+}
+
+void Model::updateVisibleJointStates() {
+    if (_showTrueJointTransforms) {
+        // no need to update visible transforms
+        return;
+    }
+    for (int i = 0; i < _jointStates.size(); i++) {
+        _jointStates[i].slaveVisibleTransform();
     }
 }
 
@@ -996,8 +1037,8 @@ bool Model::setJointPosition(int jointIndex, const glm::vec3& position, const gl
         if (useRotation) {
             JointState& state = _jointStates[jointIndex];
 
-            state.setRotationFromBindFrame(rotation, priority);
-            endRotation = state.getRotationFromBindToModelFrame();
+            state.setRotationInBindFrame(rotation, priority);
+            endRotation = state.getRotationInBindFrame();
         }    
         
         // then, we go from the joint upwards, rotating the end as close as possible to the target
@@ -1058,6 +1099,121 @@ bool Model::setJointPosition(int jointIndex, const glm::vec3& position, const gl
     return true;
 }
 
+void Model::inverseKinematics(int endIndex, glm::vec3 targetPosition, const glm::quat& targetRotation, float priority) {
+    // NOTE: targetRotation is from bind- to model-frame
+
+    if (endIndex == -1 || _jointStates.isEmpty()) {
+        return;
+    }
+
+    const FBXGeometry& geometry = _geometry->getFBXGeometry();
+    const QVector<int>& freeLineage = geometry.joints.at(endIndex).freeLineage;
+    if (freeLineage.isEmpty()) {
+        return;
+    }
+    int numFree = freeLineage.size();
+
+    // store and remember topmost parent transform
+    glm::mat4 topParentTransform;
+    {
+        int index = freeLineage.last();
+        const JointState& state = _jointStates.at(index);
+        const FBXJoint& joint = state.getFBXJoint();
+        int parentIndex = joint.parentIndex;
+        if (parentIndex == -1) {
+            const FBXGeometry& geometry = _geometry->getFBXGeometry();
+            topParentTransform = glm::scale(_scale) * glm::translate(_offset) * geometry.offset;
+        } else {
+            topParentTransform = _jointStates[parentIndex].getTransform();
+        }
+    }
+
+    // this is a cyclic coordinate descent algorithm: see
+    // http://www.ryanjuckett.com/programming/animation/21-cyclic-coordinate-descent-in-2d
+
+    // keep track of the position of the end-effector
+    JointState& endState = _jointStates[endIndex];
+    glm::vec3 endPosition = endState.getPosition();
+    float distanceToGo = glm::distance(targetPosition, endPosition);
+
+    const int MAX_ITERATION_COUNT = 2;
+    const float ACCEPTABLE_IK_ERROR = 0.005f; // 5mm
+    int numIterations = 0;
+    do {
+        ++numIterations;
+        // moving up, rotate each free joint to get endPosition closer to target
+        for (int j = 1; j < numFree; j++) {
+            int nextIndex = freeLineage.at(j);
+            JointState& nextState = _jointStates[nextIndex];
+            FBXJoint nextJoint = nextState.getFBXJoint();
+            if (! nextJoint.isFree) {
+                continue;
+            }
+
+            glm::vec3 pivot = nextState.getPosition();
+            glm::vec3 leverArm = endPosition - pivot;
+            float leverLength = glm::length(leverArm);
+            if (leverLength < EPSILON) {
+                continue;
+            }
+            glm::quat deltaRotation = rotationBetween(leverArm, targetPosition - pivot);
+
+            // We want to mix the shortest rotation with one that will pull the system down with gravity
+            // so that limbs don't float unrealistically.  To do this we compute a simplified center of mass
+            // where each joint has unit mass and we don't bother averaging it because we only need direction.
+            if (j > 1) {
+
+                glm::vec3 centerOfMass(0.0f);
+                for (int k = 0; k < j; ++k) {
+                    int massIndex = freeLineage.at(k);
+                    centerOfMass += _jointStates[massIndex].getPosition() - pivot;
+                }
+                // the gravitational effect is a rotation that tends to align the two cross products
+                const glm::vec3 worldAlignment = glm::vec3(0.0f, -1.f, 0.0f);
+                glm::quat gravityDelta = rotationBetween(glm::cross(centerOfMass, leverArm),
+                    glm::cross(worldAlignment, leverArm));
+
+                float gravityAngle = glm::angle(gravityDelta);
+                const float MIN_GRAVITY_ANGLE = 0.1f;
+                float mixFactor = 0.5f;
+                if (gravityAngle < MIN_GRAVITY_ANGLE) {
+                    // the final rotation is a mix of the two
+                    mixFactor = 0.5f * gravityAngle / MIN_GRAVITY_ANGLE;
+                }
+                deltaRotation = safeMix(deltaRotation, gravityDelta, mixFactor);
+            }
+
+            // Apply the rotation, but use mixRotationDelta() which blends a bit of the default pose
+            // at in the process.  This provides stability to the IK solution for most models.
+            glm::quat oldNextRotation = nextState.getRotation();
+            float mixFactor = 0.03f;
+            nextState.mixRotationDelta(deltaRotation, mixFactor, priority);
+
+            // measure the result of the rotation which may have been modified by
+            // blending and constraints
+            glm::quat actualDelta = nextState.getRotation() * glm::inverse(oldNextRotation);
+            endPosition = pivot + actualDelta * leverArm;
+        }
+
+        // recompute transforms from the top down
+        glm::mat4 parentTransform = topParentTransform;
+        for (int j = numFree - 1; j >= 0; --j) {
+            JointState& freeState = _jointStates[freeLineage.at(j)];
+            freeState.computeTransform(parentTransform);
+            parentTransform = freeState.getTransform();
+        }
+
+        // measure our success
+        endPosition = endState.getPosition();
+        distanceToGo = glm::distance(targetPosition, endPosition);
+    } while (numIterations < MAX_ITERATION_COUNT && distanceToGo < ACCEPTABLE_IK_ERROR);
+
+    // set final rotation of the end joint
+    endState.setRotationInBindFrame(targetRotation, priority, true);
+     
+    _shapesAreDirty = !_shapes.isEmpty();
+}
+
 bool Model::restoreJointPosition(int jointIndex, float fraction, float priority) {
     if (jointIndex == -1 || _jointStates.isEmpty()) {
         return false;
@@ -1089,55 +1245,7 @@ float Model::getLimbLength(int jointIndex) const {
 const int BALL_SUBDIVISIONS = 10;
 
 void Model::renderJointCollisionShapes(float alpha) {
-    glPushMatrix();
-    Application::getInstance()->loadTranslatedViewMatrix(_translation);
-    for (int i = 0; i < _shapes.size(); i++) {
-        Shape* shape = _shapes[i];
-        if (!shape) {
-            continue;
-        }
-
-        glPushMatrix();
-        // NOTE: the shapes are in the avatar local-frame
-        if (shape->getType() == Shape::SPHERE_SHAPE) {
-            // shapes are stored in world-frame, so we have to transform into model frame
-            glm::vec3 position = _rotation * shape->getTranslation();
-            glTranslatef(position.x, position.y, position.z);
-            const glm::quat& rotation = shape->getRotation();
-            glm::vec3 axis = glm::axis(rotation);
-            glRotatef(glm::degrees(glm::angle(rotation)), axis.x, axis.y, axis.z);
-
-            // draw a grey sphere at shape position
-            glColor4f(0.75f, 0.75f, 0.75f, alpha);
-            glutSolidSphere(shape->getBoundingRadius(), BALL_SUBDIVISIONS, BALL_SUBDIVISIONS);
-        } else if (shape->getType() == Shape::CAPSULE_SHAPE) {
-            CapsuleShape* capsule = static_cast<CapsuleShape*>(shape);
-
-            // draw a blue sphere at the capsule endpoint
-            glm::vec3 endPoint;
-            capsule->getEndPoint(endPoint);
-            endPoint = _rotation * endPoint;
-            glTranslatef(endPoint.x, endPoint.y, endPoint.z);
-            glColor4f(0.6f, 0.6f, 0.8f, alpha);
-            glutSolidSphere(capsule->getRadius(), BALL_SUBDIVISIONS, BALL_SUBDIVISIONS);
-
-            // draw a yellow sphere at the capsule startpoint
-            glm::vec3 startPoint;
-            capsule->getStartPoint(startPoint);
-            startPoint = _rotation * startPoint;
-            glm::vec3 axis = endPoint - startPoint;
-            glTranslatef(-axis.x, -axis.y, -axis.z);
-            glColor4f(0.8f, 0.8f, 0.6f, alpha);
-            glutSolidSphere(capsule->getRadius(), BALL_SUBDIVISIONS, BALL_SUBDIVISIONS);
-            
-            // draw a green cylinder between the two points
-            glm::vec3 origin(0.0f);
-            glColor4f(0.6f, 0.8f, 0.6f, alpha);
-            Avatar::renderJointConnectingCone( origin, axis, capsule->getRadius(), capsule->getRadius());
-        }
-        glPopMatrix();
-    }
-    glPopMatrix();
+    // implement this when we have shapes for regular models
 }
 
 void Model::setBlendedVertices(const QVector<glm::vec3>& vertices, const QVector<glm::vec3>& normals) {
@@ -1200,6 +1308,7 @@ void Model::deleteGeometry() {
 }
 
 void Model::renderMeshes(float alpha, RenderMode mode, bool translucent, bool receiveShadows) {
+    updateVisibleJointStates();
     const FBXGeometry& geometry = _geometry->getFBXGeometry();
     const QVector<NetworkMesh>& networkMeshes = _geometry->getMeshes();
     
@@ -1223,10 +1332,9 @@ void Model::renderMeshes(float alpha, RenderMode mode, bool translucent, bool re
         const_cast<QOpenGLBuffer&>(networkMesh.vertexBuffer).bind();
         
         ProgramObject* program = &_program;
+        Locations* locations = &_locations;
         ProgramObject* skinProgram = &_skinProgram;
         SkinLocations* skinLocations = &_skinLocations;
-        int tangentLocation = _normalMapTangentLocation;
-        int shadowDistancesLocation = _cascadedShadowMapDistancesLocation;
         GLenum specularTextureUnit = 0;
         GLenum shadowTextureUnit = 0;
         if (mode == SHADOW_RENDER_MODE) {
@@ -1239,41 +1347,40 @@ void Model::renderMeshes(float alpha, RenderMode mode, bool translucent, bool re
                 if (receiveShadows) {
                     if (cascadedShadows) {
                         program = &_cascadedShadowNormalSpecularMapProgram;
+                        locations = &_cascadedShadowNormalSpecularMapLocations;
                         skinProgram = &_skinCascadedShadowNormalSpecularMapProgram;
                         skinLocations = &_skinCascadedShadowNormalSpecularMapLocations;
-                        tangentLocation = _cascadedShadowNormalSpecularMapTangentLocation;
-                        shadowDistancesLocation = _cascadedShadowNormalSpecularMapDistancesLocation;
                     } else {
                         program = &_shadowNormalSpecularMapProgram;
+                        locations = &_shadowNormalSpecularMapLocations;
                         skinProgram = &_skinShadowNormalSpecularMapProgram;
                         skinLocations = &_skinShadowNormalSpecularMapLocations;
-                        tangentLocation = _shadowNormalSpecularMapTangentLocation;
                     }
                     shadowTextureUnit = GL_TEXTURE3;
                 } else {
                     program = &_normalSpecularMapProgram;
+                    locations = &_normalSpecularMapLocations;
                     skinProgram = &_skinNormalSpecularMapProgram;
                     skinLocations = &_skinNormalSpecularMapLocations;
-                    tangentLocation = _normalSpecularMapTangentLocation;
                 }
                 specularTextureUnit = GL_TEXTURE2;
                 
             } else if (receiveShadows) {
                 if (cascadedShadows) {
                     program = &_cascadedShadowNormalMapProgram;
+                    locations = &_cascadedShadowNormalMapLocations;
                     skinProgram = &_skinCascadedShadowNormalMapProgram;
                     skinLocations = &_skinCascadedShadowNormalMapLocations;
-                    tangentLocation = _cascadedShadowNormalMapTangentLocation;
-                    shadowDistancesLocation = _cascadedShadowNormalMapDistancesLocation;
                 } else {
                     program = &_shadowNormalMapProgram;
+                    locations = &_shadowNormalMapLocations;
                     skinProgram = &_skinShadowNormalMapProgram;
                     skinLocations = &_skinShadowNormalMapLocations;
-                    tangentLocation = _shadowNormalMapTangentLocation;
                 }
                 shadowTextureUnit = GL_TEXTURE2;
             } else {
                 program = &_normalMapProgram;
+                locations = &_normalMapLocations;
                 skinProgram = &_skinNormalMapProgram;
                 skinLocations = &_skinNormalMapLocations;
             }
@@ -1281,17 +1388,19 @@ void Model::renderMeshes(float alpha, RenderMode mode, bool translucent, bool re
             if (receiveShadows) {
                 if (cascadedShadows) {
                     program = &_cascadedShadowSpecularMapProgram;
+                    locations = &_cascadedShadowSpecularMapLocations;
                     skinProgram = &_skinCascadedShadowSpecularMapProgram;
                     skinLocations = &_skinCascadedShadowSpecularMapLocations;
-                    shadowDistancesLocation = _cascadedShadowSpecularMapDistancesLocation;
                 } else {
                     program = &_shadowSpecularMapProgram;
+                    locations = &_shadowSpecularMapLocations;
                     skinProgram = &_skinShadowSpecularMapProgram;
                     skinLocations = &_skinShadowSpecularMapLocations;
                 }
                 shadowTextureUnit = GL_TEXTURE2;
             } else {
                 program = &_specularMapProgram;
+                locations = &_specularMapLocations;
                 skinProgram = &_skinSpecularMapProgram;
                 skinLocations = &_skinSpecularMapLocations;
             }
@@ -1300,10 +1409,12 @@ void Model::renderMeshes(float alpha, RenderMode mode, bool translucent, bool re
         } else if (receiveShadows) {
             if (cascadedShadows) {
                 program = &_cascadedShadowMapProgram;
+                locations = &_cascadedShadowMapLocations;
                 skinProgram = &_skinCascadedShadowMapProgram;
                 skinLocations = &_skinCascadedShadowMapLocations;
             } else {
                 program = &_shadowMapProgram;
+                locations = &_shadowMapLocations;
                 skinProgram = &_skinShadowMapProgram;
                 skinLocations = &_skinShadowMapLocations;
             }
@@ -1312,6 +1423,7 @@ void Model::renderMeshes(float alpha, RenderMode mode, bool translucent, bool re
         
         const MeshState& state = _meshStates.at(i);
         ProgramObject* activeProgram = program;
+        Locations* activeLocations = locations;
         glPushMatrix();
         Application::getInstance()->loadTranslatedViewMatrix(_translation);
         
@@ -1328,22 +1440,22 @@ void Model::renderMeshes(float alpha, RenderMode mode, bool translucent, bool re
             skinProgram->enableAttributeArray(skinLocations->clusterIndices);
             skinProgram->enableAttributeArray(skinLocations->clusterWeights);
             activeProgram = skinProgram;
-            tangentLocation = skinLocations->tangent;
-            if (cascadedShadows) {
-                program->setUniform(skinLocations->shadowDistances, Application::getInstance()->getShadowDistances());
-            }
-        } else {    
+            activeLocations = skinLocations;
+            
+        } else {
             glMultMatrixf((const GLfloat*)&state.clusterMatrices[0]);
             program->bind();
-            if (cascadedShadows) {
-                program->setUniform(shadowDistancesLocation, Application::getInstance()->getShadowDistances());
-            }
         }
-
+        if (cascadedShadows) {
+            activeProgram->setUniform(activeLocations->shadowDistances, Application::getInstance()->getShadowDistances());
+        }
+        activeProgram->setUniformValueArray(activeLocations->localLightDirections,
+            (const GLfloat*)_localLightDirections, MAX_LOCAL_LIGHTS, 4);
+                
         if (mesh.blendshapes.isEmpty()) {
             if (!(mesh.tangents.isEmpty() || mode == SHADOW_RENDER_MODE)) {
-                activeProgram->setAttributeBuffer(tangentLocation, GL_FLOAT, vertexCount * 2 * sizeof(glm::vec3), 3);
-                activeProgram->enableAttributeArray(tangentLocation);
+                activeProgram->setAttributeBuffer(activeLocations->tangent, GL_FLOAT, vertexCount * 2 * sizeof(glm::vec3), 3);
+                activeProgram->enableAttributeArray(activeLocations->tangent);
             }
             glColorPointer(3, GL_FLOAT, 0, (void*)(vertexCount * 2 * sizeof(glm::vec3) +
                 mesh.tangents.size() * sizeof(glm::vec3)));
@@ -1352,8 +1464,8 @@ void Model::renderMeshes(float alpha, RenderMode mode, bool translucent, bool re
         
         } else {
             if (!(mesh.tangents.isEmpty() || mode == SHADOW_RENDER_MODE)) {
-                activeProgram->setAttributeBuffer(tangentLocation, GL_FLOAT, 0, 3);
-                activeProgram->enableAttributeArray(tangentLocation);
+                activeProgram->setAttributeBuffer(activeLocations->tangent, GL_FLOAT, 0, 3);
+                activeProgram->enableAttributeArray(activeLocations->tangent);
             }
             glColorPointer(3, GL_FLOAT, 0, (void*)(mesh.tangents.size() * sizeof(glm::vec3)));
             glTexCoordPointer(2, GL_FLOAT, 0, (void*)((mesh.tangents.size() + mesh.colors.size()) * sizeof(glm::vec3)));
@@ -1390,6 +1502,12 @@ void Model::renderMeshes(float alpha, RenderMode mode, bool translucent, bool re
                 glMaterialfv(GL_FRONT, GL_DIFFUSE, (const float*)&diffuse);
                 glMaterialfv(GL_FRONT, GL_SPECULAR, (const float*)&specular);
                 glMaterialf(GL_FRONT, GL_SHININESS, part.shininess);
+            
+                for (int k = 0; k < qMin(MAX_LOCAL_LIGHTS, _localLights.size()); k++) {
+                    _localLightColors[k] = glm::vec4(_localLights.at(k).color, 1.0f) * diffuse;
+                }
+                activeProgram->setUniformValueArray(activeLocations->localLightColors,
+                    (const GLfloat*)_localLightColors, MAX_LOCAL_LIGHTS, 4);
             
                 Texture* diffuseMap = networkPart.diffuseTexture.data();
                 if (mesh.isEye && diffuseMap) {
@@ -1441,7 +1559,7 @@ void Model::renderMeshes(float alpha, RenderMode mode, bool translucent, bool re
             glBindTexture(GL_TEXTURE_2D, 0);
             glActiveTexture(GL_TEXTURE0);
             
-            activeProgram->disableAttributeArray(tangentLocation);
+            activeProgram->disableAttributeArray(activeLocations->tangent);
         }
         
         if (specularTextureUnit) {
@@ -1545,6 +1663,13 @@ AnimationHandle::AnimationHandle(Model* model) :
     _running(false) {
 }
 
+AnimationDetails AnimationHandle::getAnimationDetails() const {
+    AnimationDetails details(_role, _url, _fps, _priority, _loop, _hold,
+                        _startAutomatically, _firstFrame, _lastFrame, _running, _frameIndex);
+    return details;
+}
+
+
 void AnimationHandle::simulate(float deltaTime) {
     _frameIndex += deltaTime * _fps;
     
@@ -1605,7 +1730,7 @@ void AnimationHandle::applyFrame(float frameIndex) {
         if (mapping != -1) {
             JointState& state = _model->_jointStates[mapping];
             if (_priority >= state._animationPriority) {
-                state._rotationInParentFrame = safeMix(floorFrame.rotations.at(i), ceilFrame.rotations.at(i), frameFraction);
+                state.setRotationInConstrainedFrame(safeMix(floorFrame.rotations.at(i), ceilFrame.rotations.at(i), frameFraction));
                 state._animationPriority = _priority;
             }
         }

@@ -1,9 +1,3 @@
-cmake_minimum_required(VERSION 2.8)
-
-if (WIN32)
-  cmake_policy (SET CMP0020 NEW)
-endif (WIN32)
-
 set(ROOT_DIR ../..)
 set(MACRO_DIR "${ROOT_DIR}/cmake/macros")
 
@@ -11,6 +5,9 @@ set(MACRO_DIR "${ROOT_DIR}/cmake/macros")
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/modules/")
 
 set(TARGET_NAME audio)
+
+find_package(Qt5 COMPONENTS Script)
+include_directories(SYSTEM "${Qt5Script_INCLUDE_DIRS}")
 
 # set up the external glm library
 include(${MACRO_DIR}/SetupHifiLibrary.cmake)

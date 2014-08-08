@@ -18,12 +18,14 @@
 
 #include "Avatar.h"
 
+class ModelItemID;
+
 enum AvatarHandState
 {
     HAND_STATE_NULL = 0,
-    HAND_STATE_OPEN,
-    HAND_STATE_GRASPING,
-    HAND_STATE_POINTING,
+    HAND_STATE_LEFT_POINTING,
+    HAND_STATE_RIGHT_POINTING,
+    HAND_STATE_BOTH_POINTING,
     NUM_HAND_STATES
 };
 
@@ -83,6 +85,9 @@ public:
     
     /// Stops an animation identified by its role.
     Q_INVOKABLE void stopAnimationByRole(const QString& role);
+
+    Q_INVOKABLE AnimationDetails getAnimationDetailsByRole(const QString& role);
+    Q_INVOKABLE AnimationDetails getAnimationDetails(const QString& url);
     
     // get/set avatar data
     void saveData(QSettings* settings);
@@ -124,6 +129,9 @@ public:
 
     void applyCollision(const glm::vec3& contactPoint, const glm::vec3& penetration);
 
+    /// Renders a laser pointer for UI picking
+    void renderLaserPointers();
+    glm::vec3 getLaserPointerTipPosition(const PalmData* palm);
 public slots:
     void goHome();
     void increaseSize();
@@ -142,6 +150,10 @@ public slots:
     
     glm::vec3 getLeftPalmPosition();
     glm::vec3 getRightPalmPosition();
+    
+    void clearReferential();
+    bool setModelReferential(int id);
+    bool setJointReferential(int id, int jointIndex);
     
 signals:
     void transformChanged();

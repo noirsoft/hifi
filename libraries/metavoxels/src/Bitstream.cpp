@@ -14,6 +14,7 @@
 #include <QCryptographicHash>
 #include <QDataStream>
 #include <QMetaType>
+#include <QScriptEngine>
 #include <QScriptValueIterator>
 #include <QUrl>
 #include <QtDebug>
@@ -87,6 +88,12 @@ IDStreamer& IDStreamer::operator>>(int& value) {
     return *this;
 }
 
+void Bitstream::preThreadingInit() {
+    getObjectStreamers();
+    getEnumStreamers();
+    getEnumStreamersByName();    
+}
+
 int Bitstream::registerMetaObject(const char* className, const QMetaObject* metaObject) {
     getMetaObjects().insert(className, metaObject);
     
@@ -120,6 +127,21 @@ const QMetaObject* Bitstream::getMetaObject(const QByteArray& className) {
 
 QList<const QMetaObject*> Bitstream::getMetaObjectSubClasses(const QMetaObject* metaObject) {
     return getMetaObjectSubClasses().values(metaObject);
+}
+
+QScriptValue sharedObjectPointerToScriptValue(QScriptEngine* engine, const SharedObjectPointer& pointer) {
+    return pointer ? engine->newQObject(pointer.data()) : engine->nullValue();
+}
+
+void sharedObjectPointerFromScriptValue(const QScriptValue& object, SharedObjectPointer& pointer) {
+    pointer = qobject_cast<SharedObject*>(object.toQObject());
+}
+
+void Bitstream::registerTypes(QScriptEngine* engine) {
+    foreach (const QMetaObject* metaObject, getMetaObjects()) {
+        engine->globalObject().setProperty(metaObject->className(), engine->newQMetaObject(metaObject));
+    }
+    qScriptRegisterMetaType(engine, sharedObjectPointerToScriptValue, sharedObjectPointerFromScriptValue);
 }
 
 Bitstream::Bitstream(QDataStream& underlying, MetadataType metadataType, GenericsMode genericsMode, QObject* parent) :
@@ -272,6 +294,26 @@ void Bitstream::persistReadMappings(const ReadMappings& mappings) {
 
 void Bitstream::persistAndResetReadMappings() {
     persistReadMappings(getAndResetReadMappings());
+}
+
+void Bitstream::copyPersistentMappings(const Bitstream& other) {
+    _objectStreamerStreamer.copyPersistentMappings(other._objectStreamerStreamer);
+    _typeStreamerStreamer.copyPersistentMappings(other._typeStreamerStreamer);
+    _attributeStreamer.copyPersistentMappings(other._attributeStreamer);
+    _scriptStringStreamer.copyPersistentMappings(other._scriptStringStreamer);
+    _sharedObjectStreamer.copyPersistentMappings(other._sharedObjectStreamer);
+    _sharedObjectReferences = other._sharedObjectReferences;
+    _weakSharedObjectHash = other._weakSharedObjectHash;
+}
+
+void Bitstream::clearPersistentMappings() {
+    _objectStreamerStreamer.clearPersistentMappings();
+    _typeStreamerStreamer.clearPersistentMappings();
+    _attributeStreamer.clearPersistentMappings();
+    _scriptStringStreamer.clearPersistentMappings();
+    _sharedObjectStreamer.clearPersistentMappings();
+    _sharedObjectReferences.clear();
+    _weakSharedObjectHash.clear();
 }
 
 void Bitstream::clearSharedObject(int id) {
@@ -595,6 +637,16 @@ void Bitstream::readRawDelta(QScriptValue& value, const QScriptValue& reference)
     } else {
         *this >> value;
     }
+}
+
+void Bitstream::writeAligned(const QByteArray& data) {
+    flush();
+    _underlying.device()->write(data);
+}
+
+QByteArray Bitstream::readAligned(int bytes) {
+    reset();
+    return _underlying.device()->read(bytes);
 }
 
 Bitstream& Bitstream::operator<<(bool value) {
@@ -1122,7 +1174,7 @@ Bitstream& Bitstream::operator>(ObjectStreamerPointer& streamer) {
     }
     if (_metadataType == NO_METADATA) {
         if (!metaObject) {
-            qWarning() << "Unknown class name:" << className;
+            throw BitstreamException(QString("Unknown class name: ") + className);
         }
         return *this;
     }
@@ -1232,7 +1284,7 @@ Bitstream& Bitstream::operator>(TypeStreamerPointer& streamer) {
     }
     if (_metadataType == NO_METADATA) {
         if (!baseStreamer) {
-            qWarning() << "Unknown type name:" << typeName;
+            throw BitstreamException(QString("Unknown type name: ") + typeName);
         }
         return *this;
     }
@@ -1240,7 +1292,7 @@ Bitstream& Bitstream::operator>(TypeStreamerPointer& streamer) {
     *this >> category;
     if (category == TypeStreamer::SIMPLE_CATEGORY) {
         if (!streamer) {
-            qWarning() << "Unknown type name:" << typeName;
+            throw BitstreamException(QString("Unknown type name: ") + typeName);
         }
         return *this;
     }
@@ -1441,7 +1493,7 @@ Bitstream& Bitstream::operator>(SharedObjectPointer& object) {
         _objectStreamerStreamer >> objectStreamer;
         if (delta) {
             if (!reference) {
-                qWarning() << "Delta without reference" << id << originID;
+                throw BitstreamException(QString("Delta without reference [id=%1, originID=%2]").arg(id).arg(originID));
             }
             objectStreamer->readRawDelta(*this, reference.data(), pointer.data());
         } else {
@@ -1451,7 +1503,7 @@ Bitstream& Bitstream::operator>(SharedObjectPointer& object) {
         QObject* rawObject; 
         if (delta) {
             if (!reference) {
-                qWarning() << "Delta without reference" << id << originID;
+                throw BitstreamException(QString("Delta without reference [id=%1, originID=%2]").arg(id).arg(originID));
             }
             readRawDelta(rawObject, (const QObject*)reference.data());
         } else {
@@ -1680,6 +1732,10 @@ const TypeStreamer* Bitstream::createInvalidTypeStreamer() {
     streamer->_type = QMetaType::UnknownType;
     streamer->_self = TypeStreamerPointer(streamer);
     return streamer;
+}
+
+BitstreamException::BitstreamException(const QString& description) :
+    _description(description) {
 }
 
 QJsonValue JSONWriter::getData(bool value) {
