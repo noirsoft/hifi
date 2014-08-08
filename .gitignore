@@ -52,3 +52,4 @@ interface/external/priovr/*
 
 # Ignore interfaceCache for Linux users
 interface/interfaceCache/
+dependencies/
