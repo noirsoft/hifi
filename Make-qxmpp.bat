@@ -11,4 +11,6 @@ echo Building qxmpp...
 qmake PREFIX=%HIFI_LIB_DIR%\qxmpp
 nmake
 nmake install
+cd ..\..\..\
+
 echo Done!
