@@ -1,6 +1,6 @@
 echo off
 echo Setting Environment Variables...
-call "%VS120COMNTOOLS%\vsvars32.bat"
+call "%VS100COMNTOOLS%\vsvars32.bat"
 
 echo Building GnuTLS...
 cd %HIFI_LIB_DIR%\gnutls\bin
